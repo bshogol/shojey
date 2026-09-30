@@ -6,7 +6,8 @@
 # mpv-mpris script exposes it over MPRIS, so Omarchy's media widget, media
 # keys and OSD pick it up without any extra wiring.
 #
-# Sources: SomaFM channels, Radio Browser stations, Audius tracks.
+# Sources: SomaFM and Radio Paradise channels, Radio Browser stations,
+# Audius and ccMixter tracks.
 #
 # State the bar popup reads:
 #   $XDG_RUNTIME_DIR/shojey/current.json   what was last started (gone when stopped)
@@ -30,6 +31,9 @@ RECENT_MAX=10
 AUDIUS_API="https://api.audius.co/v1"
 RADIO_API="https://all.api.radio-browser.info/json"
 SOMA_API="https://somafm.com/channels.json"
+PARADISE_API="https://api.radioparadise.com/api"
+PARADISE_STREAMS="https://stream.radioparadise.com"
+CCMIXTER_API="https://ccmixter.org/api/query"
 
 ICON_MUSIC=$'\U000f075a'
 ICON_RADIO=$'\U000f0439'
@@ -131,30 +135,62 @@ stop() {
   rm -f "$SOCKET" "$CURRENT"
 }
 
-# play <m3u-file> [start-index]
+# play <m3u-file> [start-index] [mpv flags...]
 # Replaces whatever is playing. An m3u with #EXTINF titles gives mpv (and so
 # MPRIS) a readable title for every entry, and lets next/previous walk the
 # rest of the result list.
 play_playlist() {
   local file="$1" start="${2:-0}"
+  shift 2
   stop
   # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
   mpv --no-video --idle=no --no-terminal ${SHOJEY_MPV_ARGS:-} \
     --input-ipc-server="$SOCKET" \
-    --playlist-start="$start" \
+    --playlist-start="$start" "$@" \
     --playlist="$file" >/dev/null 2>&1 &
   disown
 }
 
+# ccMixter only serves its mp3s to requests that come from its own site.
+source_flags() {
+  if jq -e 'if type == "array" then any(.[]; .source == "ccMixter") else .source == "ccMixter" end' <<<"$1" >/dev/null; then
+    echo "--referrer=https://ccmixter.org/"
+  fi
+}
+
 # play_entry <entry-json>
+# Accepts any entry from a `list` result, a favorite or a recent play.
 play_entry() {
-  local e="$1" name url
+  local e="$1" name url uuid
   name=$(jq -r '.name' <<<"$e")
   url=$(jq -r '.url' <<<"$e")
+  uuid=$(jq -r '.uuid // empty' <<<"$e")
+  # mpv expands a .pls into a nested playlist and drops our title, so play
+  # the first stream it lists directly.
+  if [[ $url == *.pls* ]]; then
+    local resolved
+    resolved=$(fetch "$url" | sed -n 's/^File1=//p' | tr -d '\r') || true
+    [[ -n $resolved ]] && url=$resolved
+  fi
+  # Count the click, as Radio Browser asks clients to; best effort.
+  [[ -n $uuid ]] && { fetch "$RADIO_API/url/$uuid" >/dev/null 2>&1 & }
+  e=$(jq -c --arg url "$url" '.url = $url | del(.uuid, .detail, .title)' <<<"$e")
   printf '#EXTM3U\n#EXTINF:-1,%s\n%s\n' "$name" "$url" >"$PLAYLIST"
   rm -f "$QUEUE"
-  play_playlist "$PLAYLIST" 0
+  # shellcheck disable=SC2046 # zero or one flag
+  play_playlist "$PLAYLIST" 0 $(source_flags "$e")
   remember "$e"
+}
+
+# play_list <index> <entries-json>
+# Queues every entry so next / previous keep going through the list.
+play_list() {
+  local index="$1"
+  jq -c 'map(del(.uuid, .detail, .title))' <<<"$2" | write_json "$QUEUE"
+  jq -r '"#EXTM3U", (.[] | "#EXTINF:-1,\(.name)", .url)' "$QUEUE" >"$PLAYLIST"
+  # shellcheck disable=SC2046 # zero or one flag
+  play_playlist "$PLAYLIST" "$index" $(source_flags "$2")
+  remember "$(jq -c ".[$index]" "$QUEUE")"
 }
 
 play_saved() {
@@ -181,98 +217,156 @@ status() {
     '{running:true, paused:$paused, title:$title}'
 }
 
+# --- sources --------------------------------------------------------------
+# Each prints a JSON array of entries, plus a `detail` line for display.
+
+list_soma() {
+  fetch "$SOMA_API" | jq -c '
+    .channels | sort_by(-(.listeners | tonumber? // 0))
+    | map({source: "SomaFM", name: .title, url: .playlists[0].url, live: true,
+           art: (.largeimage // .image // ""), detail: ((.genre | gsub("\\|"; ", ")) + " · " + .description)})'
+}
+
+# list_radio [query] — top voted stations without a query.
+list_radio() {
+  local url
+  if [[ -n ${1:-} ]]; then
+    url="$RADIO_API/stations/search?name=$(uri "$1")&limit=40&hidebroken=true&order=clickcount&reverse=true"
+  else
+    url="$RADIO_API/stations/topvote/40?hidebroken=true"
+  fi
+  fetch "$url" | jq -c '
+    map(select(.url_resolved != "")
+      | {source: "Radio", name: (.name | gsub("^\\s+|\\s+$"; "")), url: .url_resolved, live: true,
+         art: (.favicon // ""), uuid: .stationuuid,
+         detail: ([.countrycode, .codec, ((.bitrate|tostring) + "k"), (.tags | split(",")[:3] | join(", "))]
+                  | map(select(. != "" and . != "0k")) | join(" · "))})'
+}
+
+# list_audius [query] — trending without a query.
+list_audius() {
+  local url
+  if [[ -n ${1:-} ]]; then
+    url="$AUDIUS_API/tracks/search?query=$(uri "$1")&app_name=$APP_NAME&limit=50"
+  else
+    url="$AUDIUS_API/tracks/trending?app_name=$APP_NAME&limit=50"
+  fi
+  fetch "$url" | jq -c --arg api "$AUDIUS_API" --arg app "$APP_NAME" '
+    .data | map(select(.is_streamable)
+      | {source: "Audius", name: (.user.name + " - " + .title), title: .title,
+         url: ($api + "/tracks/" + .id + "/stream?app_name=" + $app), live: false,
+         art: (.artwork["150x150"] // .artwork["480x480"] // ""),
+         detail: (.user.name + " · " + ((.duration / 60 | floor | tostring) + ":"
+                  + ((.duration % 60) | tostring | if length < 2 then "0" + . else . end)))})'
+}
+
+# Radio Paradise channels. The API lists them; the stream names don't follow
+# one pattern, so they are mapped here.
+list_paradise() {
+  fetch "$PARADISE_API/list_chan?C_user_id=0&ver=2" | jq -c --arg base "$PARADISE_STREAMS" '
+    {"0": "aac-320", "1": "mellow-320", "2": "rock-320", "3": "global-320",
+     "5": "beyond-320", "42": "serenity", "945": "kfat-320"} as $streams
+    | map(select($streams[.chan])
+      | {source: "Radio Paradise", name: .title, url: ($base + "/" + $streams[.chan]), live: true,
+         art: (.banner_url // ""), chan: .chan,
+         detail: ((.current_listeners // "0") + " listening")})'
+}
+
+# What a Radio Paradise channel is playing, with cover art.
+paradise_now() {
+  fetch "$PARADISE_API/now_playing?chan=$(uri "${1:-0}")" | jq -c '{artist, title, album, cover}'
+}
+
+# list_ccmixter [query] — editor's picks without a query. f=js, not f=json:
+# the json format also copies the whole result into an X-JSON header, which
+# overflows curl's header limit past a handful of results.
+list_ccmixter() {
+  local url
+  if [[ -n ${1:-} ]]; then
+    url="$CCMIXTER_API?f=js&search=$(uri "$1")&search_type=all&sort=rank&limit=40"
+  else
+    url="$CCMIXTER_API?f=js&tags=editorial_pick&sort=date&limit=40"
+  fi
+  fetch "$url" | jq -c '
+    map((.user_name | tostring) as $user | (.upload_name | tostring) as $track | . as $u
+      | ([.files[] | select(.file_format_info["default-ext"] == "mp3")] | first) as $mp3
+      | select($mp3 != null)
+      | {source: "ccMixter", name: ($user + " - " + $track), title: $track,
+         url: $mp3.download_url, live: false, art: "",
+         detail: ([$user, ($mp3.file_format_info.ps // ""), ($u.license_name // "")]
+                  | map(select(. != "")) | join(" · "))})'
+}
+
+list() {
+  case "${1:-}" in
+    soma) list_soma ;;
+    radio) list_radio "${2:-}" ;;
+    audius) list_audius "${2:-}" ;;
+    paradise) list_paradise ;;
+    ccmixter) list_ccmixter "${2:-}" ;;
+    favorites) cat "$FAVORITES" ;;
+    recent) cat "$RECENT" ;;
+    *) fail "list: expected soma, paradise, radio, audius, ccmixter, favorites or recent" ;;
+  esac
+}
+
 # --- menus ----------------------------------------------------------------
+# The bar card browses in place; these picker menus are for keybindings and
+# the terminal.
 
 select_row() {
   omarchy-menu-select "$1" -- --width "${2:-640}"
 }
 
-# rows are "<glyph>\t<label>\t<subtext>\t<entry-json>"; the menu gets the
-# first three columns and returns "<label>\t<subtext>", which is mapped back
-# to the entry of the chosen row.
-pick_entry() {
-  local prompt="$1" rows="$2" choice
-  choice=$(cut -f1-3 <<<"$rows" | select_row "$prompt") || return 1
-  [[ -n $choice ]] || return 1
-  awk -F '\t' -v c="$choice" '($2 "\t" $3) == c { print $4; exit }' <<<"$rows"
-}
-
-pick_index() {
-  local prompt="$1" rows="$2" choice
-  choice=$(cut -f1-3 <<<"$rows" | select_row "$prompt") || return 1
+# Shows a list of entries in the picker and prints the chosen index. The
+# menu returns "<label>\t<subtext>", which is mapped back to its row.
+pick() {
+  local prompt="$1" entries="$2" icon="$3" rows choice
+  rows=$(jq -r --arg icon "$icon" '.[] | [$icon, .name, (.detail // .source)] | map(gsub("\t"; " ")) | @tsv' <<<"$entries")
+  [[ -n $rows ]] || { notify "Nothing found"; return 1; }
+  choice=$(select_row "$prompt" <<<"$rows") || return 1
   [[ -n $choice ]] || return 1
   awk -F '\t' -v c="$choice" '($2 "\t" $3) == c { print NR - 1; exit }' <<<"$rows"
 }
 
+menu_list() {
+  local prompt="$1" entries="$2" icon="$3" queue="${4:-}" index
+  index=$(pick "$prompt" "$entries" "$icon") || return 0
+  if [[ -n $queue ]]; then
+    play_list "$index" "$entries"
+  else
+    play_entry "$(jq -c ".[$index]" <<<"$entries")"
+  fi
+}
+
 menu_soma() {
-  local rows e url
-  rows=$(fetch "$SOMA_API" | jq -r --arg icon "$ICON_RADIO" '
-    .channels | sort_by(-(.listeners | tonumber? // 0))[]
-    | [$icon, .title, (.genre + " · " + .description),
-       ({source: "SomaFM", name: .title, url: .playlists[0].url, live: true, art: (.largeimage // .image // "")} | tojson)]
-    | map(gsub("\t"; " ")) | @tsv') || fail "could not load SomaFM channels"
-  e=$(pick_entry "SomaFM" "$rows") || return 0
-  # mpv expands a .pls into a nested playlist and drops our title, so play
-  # the first stream it lists directly.
-  url=$(fetch "$(jq -r '.url' <<<"$e")" | sed -n 's/^File1=//p' | tr -d '\r')
-  [[ -n $url ]] && e=$(jq -c --arg url "$url" '.url = $url' <<<"$e")
-  play_entry "$e"
+  menu_list "SomaFM" "$(list_soma || fail "could not load SomaFM channels")" "$ICON_RADIO"
 }
 
 menu_radio() {
-  local query rows e
+  local query
   query=$(omarchy-menu-input "Search radio (name or tag)") || return 0
   [[ -n $query ]] || return 0
-  rows=$(fetch "$RADIO_API/stations/search?name=$(uri "$query")&limit=40&hidebroken=true&order=clickcount&reverse=true" |
-    jq -r --arg icon "$ICON_RADIO" '
-      .[] | select(.url_resolved != "")
-      | [$icon, .name,
-         ([.countrycode, .codec, ((.bitrate|tostring) + "k"), (.tags | split(",")[:3] | join(", "))] | map(select(. != "" and . != "0k")) | join(" · ")),
-         ({source: "Radio", name: .name, url: .url_resolved, live: true, art: (.favicon // ""), uuid: .stationuuid} | tojson)]
-      | map(gsub("\t"; " ")) | @tsv') || fail "Radio Browser search failed"
-  [[ -n $rows ]] || { notify "No stations for \"$query\""; return 0; }
-  e=$(pick_entry "Radio · $query" "$rows") || return 0
-  # Count the click, as Radio Browser asks clients to; best effort.
-  fetch "$RADIO_API/url/$(jq -r '.uuid' <<<"$e")" >/dev/null 2>&1 &
-  play_entry "$(jq -c 'del(.uuid)' <<<"$e")"
+  menu_list "Radio · $query" "$(list_radio "$query" || fail "Radio Browser search failed")" "$ICON_RADIO"
 }
 
-audius_rows() {
-  jq -r --arg icon "$ICON_MUSIC" --arg api "$AUDIUS_API" --arg app "$APP_NAME" '
-    .data[] | select(.is_streamable)
-    | [$icon, .title,
-       (.user.name + " · " + ((.duration / 60 | floor | tostring) + ":" + ((.duration % 60) | tostring | if length < 2 then "0" + . else . end))),
-       ({source: "Audius", name: (.user.name + " - " + .title),
-         url: ($api + "/tracks/" + .id + "/stream?app_name=" + $app),
-         live: false, art: (.artwork["480x480"] // .artwork["150x150"] // "")} | tojson)]
-    | map(gsub("\t"; " ")) | @tsv'
+menu_paradise() {
+  menu_list "Radio Paradise" "$(list_paradise || fail "could not load Radio Paradise channels")" "$ICON_RADIO"
 }
 
-play_audius() {
-  local prompt="$1" rows="$2" index
-  [[ -n $rows ]] || { notify "No tracks found"; return 0; }
-  index=$(pick_index "$prompt" "$rows") || return 0
-  # Queue every result so next/previous keep going through the list.
-  cut -f4 <<<"$rows" | jq -s -c '.' | write_json "$QUEUE"
-  jq -r '"#EXTM3U", (.[] | "#EXTINF:-1,\(.name)", .url)' "$QUEUE" >"$PLAYLIST"
-  play_playlist "$PLAYLIST" "$index"
-  remember "$(jq -c ".[$index]" "$QUEUE")"
+menu_ccmixter() {
+  menu_list "ccMixter · Editor's picks" "$(list_ccmixter || fail "could not load ccMixter")" "$ICON_MUSIC" queue
 }
 
 menu_audius_trending() {
-  local rows
-  rows=$(fetch "$AUDIUS_API/tracks/trending?app_name=$APP_NAME&limit=50" | audius_rows) ||
-    fail "could not load Audius trending"
-  play_audius "Audius · Trending" "$rows"
+  menu_list "Audius · Trending" "$(list_audius || fail "could not load Audius trending")" "$ICON_MUSIC" queue
 }
 
 menu_audius_search() {
-  local query rows
+  local query
   query=$(omarchy-menu-input "Search Audius tracks") || return 0
   [[ -n $query ]] || return 0
-  rows=$(fetch "$AUDIUS_API/tracks/search?query=$(uri "$query")&app_name=$APP_NAME&limit=50" | audius_rows) ||
-    fail "Audius search failed"
-  play_audius "Audius · $query" "$rows"
+  menu_list "Audius · $query" "$(list_audius "$query" || fail "Audius search failed")" "$ICON_MUSIC" queue
 }
 
 menu_audius() {
@@ -285,11 +379,7 @@ menu_audius() {
 }
 
 menu_favorites() {
-  local rows e
-  rows=$(jq -r --arg icon "$ICON_HEART" '.[] | [$icon, .name, .source, tojson] | map(gsub("\t"; " ")) | @tsv' "$FAVORITES")
-  [[ -n $rows ]] || { notify "No favorites yet"; return 0; }
-  e=$(pick_entry "Favorites" "$rows") || return 0
-  play_entry "$e"
+  menu_list "Favorites" "$(cat "$FAVORITES")" "$ICON_HEART"
 }
 
 menu() {
@@ -298,9 +388,11 @@ menu() {
     running && printf '%s\t%s\n' "$ICON_PAUSE" "Play / Pause" "$ICON_STOP" "Stop"
     printf '%s\t%s\n' \
       "$ICON_RADIO" "SomaFM" \
+      "$ICON_RADIO" "Radio Paradise" \
       "$ICON_SEARCH" "Radio search" \
       "$ICON_TRENDING" "Audius trending" \
       "$ICON_SEARCH" "Audius search" \
+      "$ICON_MUSIC" "ccMixter" \
       "$ICON_HEART" "Favorites"
   )
   choice=$(select_row "shojey" 360 <<<"$rows") || return 0
@@ -308,9 +400,11 @@ menu() {
     "Play / Pause") toggle ;;
     "Stop") stop ;;
     "SomaFM") menu_soma ;;
+    "Radio Paradise") menu_paradise ;;
     "Radio search") menu_radio ;;
     "Audius trending") menu_audius_trending ;;
     "Audius search") menu_audius_search ;;
+    "ccMixter") menu_ccmixter ;;
     "Favorites") menu_favorites ;;
   esac
 }
@@ -319,29 +413,47 @@ usage() {
   cat <<USAGE
 Usage: shojey <command>
 
-  menu               open the source picker (default)
-  soma | radio | audius | trending | search | favorites
-                     jump straight to one source
-  play <url> [title] play a stream or file
-  play-saved <url>   replay a recent or favorite entry
-  fav [url] [title]  toggle a favorite (default: what's playing)
-  toggle             pause / resume
-  stop               stop playback
-  status             print player state as JSON
+  menu                 open the source picker (default)
+  soma | paradise | radio | audius | trending | search | ccmixter | favorites
+                       jump straight to one source in the picker
+  list soma | paradise | radio [query] | audius [query] | ccmixter [query]
+       | favorites | recent
+                       print entries as JSON
+  paradise-now <chan>  current Radio Paradise song and cover as JSON
+  play <url> [title]   play a stream or file
+  play-json <entry>    play one entry from \`list\`
+  play-list <i> <json> queue a \`list\` result and start at index i
+  play-saved <url>     replay a recent or favorite entry
+  fav [url] [title]    toggle a favorite (default: what's playing)
+  toggle               pause / resume
+  stop                 stop playback
+  status               print player state as JSON
 USAGE
 }
 
 case "${1:-menu}" in
   menu) menu ;;
   soma) menu_soma ;;
+  paradise) menu_paradise ;;
+  ccmixter) menu_ccmixter ;;
   radio) menu_radio ;;
   audius) menu_audius ;;
   trending) menu_audius_trending ;;
   search) menu_audius_search ;;
   favorites) menu_favorites ;;
+  list) list "${2:-}" "${3:-}" ;;
+  paradise-now) paradise_now "${2:-0}" ;;
   play)
     [[ -n ${2:-} ]] || fail "play needs a url"
     play_entry "$(entry "Stream" "${3:-$2}" "$2" false)"
+    ;;
+  play-json)
+    [[ -n ${2:-} ]] || fail "play-json needs an entry"
+    play_entry "$2"
+    ;;
+  play-list)
+    [[ ${2:-} =~ ^[0-9]+$ && -n ${3:-} ]] || fail "play-list needs an index and a JSON list"
+    play_list "$2" "$3"
     ;;
   play-saved)
     [[ -n ${2:-} ]] || fail "play-saved needs a url"
