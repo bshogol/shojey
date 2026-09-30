@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "boris.shojey",
+  "name": "shojey",
+  "version": "0.1.0",
+  "author": "Boris",
+  "license": "MIT",
+  "description": "A tiny music player: SomaFM, Radio Browser and Audius streamed through mpv, controlled from the bar and your media keys.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "shojey",
+    "description": "Pick a radio station or Audius track and play it through mpv.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

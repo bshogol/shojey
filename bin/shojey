@@ -1,0 +1,359 @@
+#!/bin/bash
+
+# shojey — a tiny music player for Omarchy.
+#
+# Playback is a single background mpv with an IPC socket. The system-wide
+# mpv-mpris script exposes it over MPRIS, so Omarchy's media widget, media
+# keys and OSD pick it up without any extra wiring.
+#
+# Sources: SomaFM channels, Radio Browser stations, Audius tracks.
+#
+# State the bar popup reads:
+#   $XDG_RUNTIME_DIR/shojey/current.json   what was last started (gone when stopped)
+#   $XDG_STATE_HOME/shojey/recent.json     last 10 things played
+#   $XDG_STATE_HOME/shojey/favorites.json  hearted entries
+# Each entry is {source, name, url, live, art}.
+
+set -euo pipefail
+
+APP_NAME="shojey"
+USER_AGENT="shojey/0.1"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/shojey"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shojey"
+SOCKET="$RUNTIME_DIR/mpv.sock"
+PLAYLIST="$RUNTIME_DIR/queue.m3u"
+QUEUE="$RUNTIME_DIR/queue.json"
+CURRENT="$RUNTIME_DIR/current.json"
+RECENT="$STATE_DIR/recent.json"
+FAVORITES="$STATE_DIR/favorites.json"
+RECENT_MAX=10
+AUDIUS_API="https://api.audius.co/v1"
+RADIO_API="https://all.api.radio-browser.info/json"
+SOMA_API="https://somafm.com/channels.json"
+
+ICON_MUSIC=$'\U000f075a'
+ICON_RADIO=$'\U000f0439'
+ICON_SEARCH=$'\U000f0349'
+ICON_TRENDING=$'\U000f0535'
+ICON_STOP=$'\U000f04db'
+ICON_PAUSE=$'\U000f03e4'
+ICON_HEART=$'\U000f02d1'
+
+mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
+[[ -f $RECENT ]] || echo '[]' >"$RECENT"
+[[ -f $FAVORITES ]] || echo '[]' >"$FAVORITES"
+
+fail() {
+  echo "shojey: $*" >&2
+  notify "$*"
+  exit 1
+}
+
+notify() {
+  command -v omarchy-notification-send >/dev/null && omarchy-notification-send "shojey" "$*" || true
+}
+
+fetch() {
+  curl -fsSL --max-time 15 -A "$USER_AGENT" "$@"
+}
+
+uri() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+# --- state ----------------------------------------------------------------
+
+# entry <source> <name> <url> <live:true|false> [art]
+entry() {
+  jq -cn --arg source "$1" --arg name "$2" --arg url "$3" --argjson live "$4" --arg art "${5:-}" \
+    '{source:$source, name:$name, url:$url, live:$live, art:$art}'
+}
+
+# Write through a temp file so the popup's file watcher never reads half a file.
+write_json() {
+  local file="$1" tmp
+  tmp=$(mktemp "$file.XXXXXX")
+  cat >"$tmp"
+  mv "$tmp" "$file"
+}
+
+remember() {
+  local e="$1"
+  write_json "$CURRENT" <<<"$e"
+  jq -c --argjson e "$e" --argjson max "$RECENT_MAX" \
+    '[$e] + map(select(.url != $e.url)) | .[:$max]' "$RECENT" | write_json "$RECENT"
+}
+
+# Look a url up in everything shojey knows about, newest first.
+lookup() {
+  local url="$1" files=()
+  local f
+  for f in "$CURRENT" "$QUEUE" "$FAVORITES" "$RECENT"; do
+    [[ -s $f ]] && files+=("$f")
+  done
+  (( ${#files[@]} )) || return 1
+  jq -cs --arg url "$url" '
+    map(if type == "array" then .[] else . end) | map(select(.url == $url)) | first // empty
+  ' "${files[@]}"
+}
+
+toggle_favorite() {
+  local url="${1:-}" name="${2:-}" e
+  if [[ -z $url ]]; then
+    [[ -s $CURRENT ]] || fail "nothing playing to favorite"
+    url=$(jq -r '.url' "$CURRENT")
+  fi
+  if jq -e --arg url "$url" 'any(.[]; .url == $url)' "$FAVORITES" >/dev/null; then
+    jq -c --arg url "$url" 'map(select(.url != $url))' "$FAVORITES" | write_json "$FAVORITES"
+    return
+  fi
+  e=$(lookup "$url") || true
+  [[ -n $e ]] || e=$(entry "Stream" "${name:-$url}" "$url" false)
+  # A queued Audius track keeps its own title, not the one it was queued under.
+  [[ -n $name ]] && e=$(jq -c --arg name "$name" '.name = $name' <<<"$e")
+  jq -c --argjson e "$e" '[$e] + .' "$FAVORITES" | write_json "$FAVORITES"
+}
+
+# --- playback -------------------------------------------------------------
+
+running() {
+  [[ -S $SOCKET ]] && ipc '{"command":["get_property","pid"]}' >/dev/null 2>&1
+}
+
+ipc() {
+  socat - "UNIX-CONNECT:$SOCKET" <<<"$1"
+}
+
+stop() {
+  if running; then
+    ipc '{"command":["quit"]}' >/dev/null || true
+  fi
+  rm -f "$SOCKET" "$CURRENT"
+}
+
+# play <m3u-file> [start-index]
+# Replaces whatever is playing. An m3u with #EXTINF titles gives mpv (and so
+# MPRIS) a readable title for every entry, and lets next/previous walk the
+# rest of the result list.
+play_playlist() {
+  local file="$1" start="${2:-0}"
+  stop
+  # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
+  mpv --no-video --idle=no --no-terminal ${SHOJEY_MPV_ARGS:-} \
+    --input-ipc-server="$SOCKET" \
+    --playlist-start="$start" \
+    --playlist="$file" >/dev/null 2>&1 &
+  disown
+}
+
+# play_entry <entry-json>
+play_entry() {
+  local e="$1" name url
+  name=$(jq -r '.name' <<<"$e")
+  url=$(jq -r '.url' <<<"$e")
+  printf '#EXTM3U\n#EXTINF:-1,%s\n%s\n' "$name" "$url" >"$PLAYLIST"
+  rm -f "$QUEUE"
+  play_playlist "$PLAYLIST" 0
+  remember "$e"
+}
+
+play_saved() {
+  local url="$1" e
+  e=$(lookup "$url") || true
+  [[ -n $e ]] || e=$(entry "Stream" "$url" "$url" false)
+  play_entry "$e"
+}
+
+toggle() {
+  running || return 0
+  ipc '{"command":["cycle","pause"]}' >/dev/null
+}
+
+status() {
+  if ! running; then
+    echo '{"running":false,"paused":false,"title":""}'
+    return
+  fi
+  local paused title
+  paused=$(ipc '{"command":["get_property","pause"]}' | jq -r '.data // false')
+  title=$(ipc '{"command":["get_property","media-title"]}' | jq -r '.data // ""')
+  jq -cn --argjson paused "$paused" --arg title "$title" \
+    '{running:true, paused:$paused, title:$title}'
+}
+
+# --- menus ----------------------------------------------------------------
+
+select_row() {
+  omarchy-menu-select "$1" -- --width "${2:-640}"
+}
+
+# rows are "<glyph>\t<label>\t<subtext>\t<entry-json>"; the menu gets the
+# first three columns and returns "<label>\t<subtext>", which is mapped back
+# to the entry of the chosen row.
+pick_entry() {
+  local prompt="$1" rows="$2" choice
+  choice=$(cut -f1-3 <<<"$rows" | select_row "$prompt") || return 1
+  [[ -n $choice ]] || return 1
+  awk -F '\t' -v c="$choice" '($2 "\t" $3) == c { print $4; exit }' <<<"$rows"
+}
+
+pick_index() {
+  local prompt="$1" rows="$2" choice
+  choice=$(cut -f1-3 <<<"$rows" | select_row "$prompt") || return 1
+  [[ -n $choice ]] || return 1
+  awk -F '\t' -v c="$choice" '($2 "\t" $3) == c { print NR - 1; exit }' <<<"$rows"
+}
+
+menu_soma() {
+  local rows e url
+  rows=$(fetch "$SOMA_API" | jq -r --arg icon "$ICON_RADIO" '
+    .channels | sort_by(-(.listeners | tonumber? // 0))[]
+    | [$icon, .title, (.genre + " · " + .description),
+       ({source: "SomaFM", name: .title, url: .playlists[0].url, live: true, art: (.largeimage // .image // "")} | tojson)]
+    | map(gsub("\t"; " ")) | @tsv') || fail "could not load SomaFM channels"
+  e=$(pick_entry "SomaFM" "$rows") || return 0
+  # mpv expands a .pls into a nested playlist and drops our title, so play
+  # the first stream it lists directly.
+  url=$(fetch "$(jq -r '.url' <<<"$e")" | sed -n 's/^File1=//p' | tr -d '\r')
+  [[ -n $url ]] && e=$(jq -c --arg url "$url" '.url = $url' <<<"$e")
+  play_entry "$e"
+}
+
+menu_radio() {
+  local query rows e
+  query=$(omarchy-menu-input "Search radio (name or tag)") || return 0
+  [[ -n $query ]] || return 0
+  rows=$(fetch "$RADIO_API/stations/search?name=$(uri "$query")&limit=40&hidebroken=true&order=clickcount&reverse=true" |
+    jq -r --arg icon "$ICON_RADIO" '
+      .[] | select(.url_resolved != "")
+      | [$icon, .name,
+         ([.countrycode, .codec, ((.bitrate|tostring) + "k"), (.tags | split(",")[:3] | join(", "))] | map(select(. != "" and . != "0k")) | join(" · ")),
+         ({source: "Radio", name: .name, url: .url_resolved, live: true, art: (.favicon // ""), uuid: .stationuuid} | tojson)]
+      | map(gsub("\t"; " ")) | @tsv') || fail "Radio Browser search failed"
+  [[ -n $rows ]] || { notify "No stations for \"$query\""; return 0; }
+  e=$(pick_entry "Radio · $query" "$rows") || return 0
+  # Count the click, as Radio Browser asks clients to; best effort.
+  fetch "$RADIO_API/url/$(jq -r '.uuid' <<<"$e")" >/dev/null 2>&1 &
+  play_entry "$(jq -c 'del(.uuid)' <<<"$e")"
+}
+
+audius_rows() {
+  jq -r --arg icon "$ICON_MUSIC" --arg api "$AUDIUS_API" --arg app "$APP_NAME" '
+    .data[] | select(.is_streamable)
+    | [$icon, .title,
+       (.user.name + " · " + ((.duration / 60 | floor | tostring) + ":" + ((.duration % 60) | tostring | if length < 2 then "0" + . else . end))),
+       ({source: "Audius", name: (.user.name + " - " + .title),
+         url: ($api + "/tracks/" + .id + "/stream?app_name=" + $app),
+         live: false, art: (.artwork["480x480"] // .artwork["150x150"] // "")} | tojson)]
+    | map(gsub("\t"; " ")) | @tsv'
+}
+
+play_audius() {
+  local prompt="$1" rows="$2" index
+  [[ -n $rows ]] || { notify "No tracks found"; return 0; }
+  index=$(pick_index "$prompt" "$rows") || return 0
+  # Queue every result so next/previous keep going through the list.
+  cut -f4 <<<"$rows" | jq -s -c '.' | write_json "$QUEUE"
+  jq -r '"#EXTM3U", (.[] | "#EXTINF:-1,\(.name)", .url)' "$QUEUE" >"$PLAYLIST"
+  play_playlist "$PLAYLIST" "$index"
+  remember "$(jq -c ".[$index]" "$QUEUE")"
+}
+
+menu_audius_trending() {
+  local rows
+  rows=$(fetch "$AUDIUS_API/tracks/trending?app_name=$APP_NAME&limit=50" | audius_rows) ||
+    fail "could not load Audius trending"
+  play_audius "Audius · Trending" "$rows"
+}
+
+menu_audius_search() {
+  local query rows
+  query=$(omarchy-menu-input "Search Audius tracks") || return 0
+  [[ -n $query ]] || return 0
+  rows=$(fetch "$AUDIUS_API/tracks/search?query=$(uri "$query")&app_name=$APP_NAME&limit=50" | audius_rows) ||
+    fail "Audius search failed"
+  play_audius "Audius · $query" "$rows"
+}
+
+menu_audius() {
+  local choice
+  choice=$(printf '%s\t%s\n' "$ICON_TRENDING" "Trending" "$ICON_SEARCH" "Search" | select_row "Audius" 360) || return 0
+  case "$choice" in
+    "Trending") menu_audius_trending ;;
+    "Search") menu_audius_search ;;
+  esac
+}
+
+menu_favorites() {
+  local rows e
+  rows=$(jq -r --arg icon "$ICON_HEART" '.[] | [$icon, .name, .source, tojson] | map(gsub("\t"; " ")) | @tsv' "$FAVORITES")
+  [[ -n $rows ]] || { notify "No favorites yet"; return 0; }
+  e=$(pick_entry "Favorites" "$rows") || return 0
+  play_entry "$e"
+}
+
+menu() {
+  local rows choice
+  rows=$(
+    running && printf '%s\t%s\n' "$ICON_PAUSE" "Play / Pause" "$ICON_STOP" "Stop"
+    printf '%s\t%s\n' \
+      "$ICON_RADIO" "SomaFM" \
+      "$ICON_SEARCH" "Radio search" \
+      "$ICON_TRENDING" "Audius trending" \
+      "$ICON_SEARCH" "Audius search" \
+      "$ICON_HEART" "Favorites"
+  )
+  choice=$(select_row "shojey" 360 <<<"$rows") || return 0
+  case "$choice" in
+    "Play / Pause") toggle ;;
+    "Stop") stop ;;
+    "SomaFM") menu_soma ;;
+    "Radio search") menu_radio ;;
+    "Audius trending") menu_audius_trending ;;
+    "Audius search") menu_audius_search ;;
+    "Favorites") menu_favorites ;;
+  esac
+}
+
+usage() {
+  cat <<USAGE
+Usage: shojey <command>
+
+  menu               open the source picker (default)
+  soma | radio | audius | trending | search | favorites
+                     jump straight to one source
+  play <url> [title] play a stream or file
+  play-saved <url>   replay a recent or favorite entry
+  fav [url] [title]  toggle a favorite (default: what's playing)
+  toggle             pause / resume
+  stop               stop playback
+  status             print player state as JSON
+USAGE
+}
+
+case "${1:-menu}" in
+  menu) menu ;;
+  soma) menu_soma ;;
+  radio) menu_radio ;;
+  audius) menu_audius ;;
+  trending) menu_audius_trending ;;
+  search) menu_audius_search ;;
+  favorites) menu_favorites ;;
+  play)
+    [[ -n ${2:-} ]] || fail "play needs a url"
+    play_entry "$(entry "Stream" "${3:-$2}" "$2" false)"
+    ;;
+  play-saved)
+    [[ -n ${2:-} ]] || fail "play-saved needs a url"
+    play_saved "$2"
+    ;;
+  fav) toggle_favorite "${2:-}" "${3:-}" ;;
+  toggle) toggle ;;
+  stop) stop ;;
+  status) status ;;
+  -h | --help | help) usage ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
