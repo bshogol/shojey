@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The sources are third-party APIs; a weekly run catches one changing shape.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/shojey
+      - run: jq -e . manifest.json >/dev/null
+
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every source lists playable entries
+        run: |
+          for source in soma paradise radio audius ccmixter; do
+            echo "::group::$source"
+            bin/shojey list "$source" | tee /dev/stderr \
+              | jq -e 'type == "array" and length > 0 and all(.[]; (.name | length > 0) and (.url | startswith("http")))' >/dev/null
+            echo "::endgroup::"
+          done
+      - name: Searches return entries
+        run: |
+          bin/shojey list radio jazz | jq -e 'length > 0' >/dev/null
+          bin/shojey list audius ambient | jq -e 'length > 0' >/dev/null
+          bin/shojey list ccmixter piano | jq -e 'length > 0' >/dev/null
