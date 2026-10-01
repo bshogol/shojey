@@ -34,21 +34,31 @@ BarWidget {
   readonly property string glyphHeart: String.fromCodePoint(0xf02d1)
   readonly property string glyphHeartOutline: String.fromCodePoint(0xf02d5)
   readonly property string glyphBack: String.fromCodePoint(0xf004d)
+  readonly property string glyphClose: String.fromCodePoint(0xf0156)
+  readonly property string glyphRetry: String.fromCodePoint(0xf0450)
 
   readonly property var sources: ({
     soma: { title: "SomaFM", placeholder: "Filter channels", local: true },
     paradise: { title: "Radio Paradise", placeholder: "Filter channels", local: true },
     radio: { title: "Radio", placeholder: "Search stations (top voted shown)" },
     audius: { title: "Audius", placeholder: "Search tracks (trending shown)", queue: true },
-    ccmixter: { title: "ccMixter", placeholder: "Search tracks (editor's picks shown)", queue: true }
+    ccmixter: { title: "ccMixter", placeholder: "Search tracks (editor's picks shown)", queue: true },
+    favorites: { title: "Favorites", placeholder: "Filter favorites", local: true, saved: true },
+    recent: { title: "Recent", placeholder: "Filter recent plays", local: true, saved: true }
   })
 
-  // mpv-mpris registers as identity "mpv". Any mpv counts, which is fine for
-  // a player that only ever runs one mpv; control goes through MPRIS.
+  // mpv-mpris registers every mpv as identity "mpv", so only count the one
+  // playing a url shojey started; a video in another mpv is left alone.
   readonly property var player: {
+    var known = ({})
+    if (current) known[current.url] = true
+    for (var q = 0; q < queue.length; q++) if (queue[q]) known[queue[q].url] = true
     var list = Mpris.players ? Mpris.players.values : []
     for (var i = 0; i < list.length; i++) {
-      if (list[i] && String(list[i].identity || "").toLowerCase() === "mpv") return list[i]
+      var p = list[i]
+      if (!p || String(p.identity || "").toLowerCase() !== "mpv") continue
+      var url = p.metadata ? p.metadata["xesam:url"] : undefined
+      if (url !== undefined && known[String(url)]) return p
     }
     return null
   }
@@ -59,6 +69,11 @@ BarWidget {
   property var recent: []
   property var favorites: []
   property var queue: []
+  property var lastError: null          // {entry, message} when playback failed
+
+  // Started but not on MPRIS yet: mpv is still connecting.
+  readonly property bool connecting: player === null && current !== null
+  readonly property var resumeEntry: recent.length > 0 ? recent[0] : null
 
   readonly property string playingUrl: player && player.metadata && player.metadata["xesam:url"]
     ? String(player.metadata["xesam:url"]) : (current ? current.url : "")
@@ -74,8 +89,8 @@ BarWidget {
     : (player && player.trackArtist ? String(player.trackArtist) : "")
   readonly property string sourceLabel: {
     if (!entry) return ""
-    if (entry.source === "Audius") return "Audius"
-    return entry.source + " · " + entry.name
+    // A station names its channel; a track's own name is already the title.
+    return entry.live ? entry.source + " · " + entry.name : entry.source
   }
   // Radio Paradise publishes the cover of the song on air; other stations
   // only have a channel logo.
@@ -94,10 +109,12 @@ BarWidget {
   property int selectedIndex: 0
   property int requestSeq: 0
 
+  readonly property var browseList: browseKind === "favorites" ? favorites
+    : browseKind === "recent" ? recent : results
   readonly property var visibleResults: {
-    if (!sources[browseKind].local || !searchField.text) return results
+    if (!sources[browseKind].local || !searchField.text) return browseList
     var q = searchField.text.toLowerCase()
-    return results.filter(function(e) {
+    return browseList.filter(function(e) {
       return (e.name + " " + (e.detail || "")).toLowerCase().indexOf(q) !== -1
     })
   }
@@ -137,6 +154,7 @@ BarWidget {
     recentFile.reload()
     favoritesFile.reload()
     queueFile.reload()
+    errorFile.reload()
   }
 
   function formatTime(seconds) {
@@ -159,7 +177,9 @@ BarWidget {
     loadError = ""
     selectedIndex = 0
     searchField.text = ""
-    fetchResults("")
+    loading = false
+    // Favorites and recent come straight from the state files.
+    if (!sources[kind].saved) fetchResults("")
     Qt.callLater(function() { searchField.forceActiveFocus() })
   }
 
@@ -221,9 +241,16 @@ BarWidget {
     var list = visibleResults
     if (index < 0 || index >= list.length) return
     // Track results play as a queue so next / previous walk the list.
-    if (sources[browseKind].queue) shojey(["play-list", String(index), JSON.stringify(list)])
+    if (sources[browseKind].saved) shojey(["play-saved", list[index].url])
+    else if (sources[browseKind].queue) shojey(["play-list", String(index), JSON.stringify(list)])
     else shojey(["play-json", JSON.stringify(list[index])])
     goHome()
+  }
+
+  function removeSaved(entry) {
+    if (!entry) return
+    if (browseKind === "favorites") shojey(["fav", entry.url])
+    else if (browseKind === "recent") shojey(["forget", entry.url])
   }
 
   function moveSelection(delta) {
@@ -285,6 +312,16 @@ BarWidget {
     onFileChanged: reload()
     onLoaded: root.favorites = root.parse(favoritesFile, [])
     onLoadFailed: root.favorites = []
+  }
+
+  FileView {
+    id: errorFile
+    path: root.runtimeDir + "/error.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.lastError = root.parse(errorFile, null)
+    onLoadFailed: root.lastError = null
   }
 
   FileView {
@@ -432,7 +469,11 @@ BarWidget {
               anchors.margins: Style.space(2)
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
-              source: root.player ? root.artUrl : ""
+              source: root.player ? root.artUrl
+                : root.connecting ? (root.current.art || "")
+                : root.lastError ? (root.lastError.entry.art || "")
+                : root.resumeEntry ? (root.resumeEntry.art || "") : ""
+              opacity: root.player || root.connecting ? 1 : 0.5
               visible: status === Image.Ready
             }
 
@@ -454,7 +495,10 @@ BarWidget {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: root.player ? (root.title || "Loading…") : "Nothing playing"
+              text: root.player ? (root.title || "Loading…")
+                : root.connecting ? root.current.name
+                : root.lastError ? "Couldn't play " + root.lastError.entry.name
+                : "Nothing playing"
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.subtitle
@@ -465,7 +509,11 @@ BarWidget {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: root.player ? root.artist : "Pick a source below"
+              text: root.player ? root.artist
+                : root.connecting ? "Connecting…"
+                : root.lastError ? root.lastError.message
+                : root.resumeEntry ? "Last played · " + root.resumeEntry.name
+                : "Pick a source below"
               visible: text !== ""
               color: Qt.darker(root.bar.foreground, 1.3)
               font.family: root.bar.fontFamily
@@ -526,6 +574,42 @@ BarWidget {
             tooltipText: root.favorite ? "Remove from favorites" : "Add to favorites"
             enabled: root.playingUrl !== ""
             onClicked: root.toggleFavorite()
+          }
+        }
+
+        // Nothing playing: retry a failed stream, or pick up where you left off.
+        Row {
+          visible: root.player === null && !root.connecting && (root.lastError !== null || root.resumeEntry !== null)
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(6)
+
+          Button {
+            visible: root.lastError !== null
+            iconText: root.glyphRetry
+            text: "Retry"
+            bordered: true
+            selected: true
+            foreground: root.bar.foreground
+            onClicked: root.shojey(["play-saved", root.lastError.entry.url])
+          }
+
+          Button {
+            visible: root.lastError !== null
+            iconText: root.glyphClose
+            text: "Dismiss"
+            bordered: true
+            foreground: root.bar.foreground
+            onClicked: root.shojey(["dismiss"])
+          }
+
+          Button {
+            visible: root.lastError === null
+            iconText: root.glyphPlay
+            text: "Resume"
+            bordered: true
+            selected: true
+            foreground: root.bar.foreground
+            onClicked: root.shojey(["resume"])
           }
         }
 
@@ -617,11 +701,13 @@ BarWidget {
 
         Repeater {
           model: [
-            { label: "Favorites", items: root.favorites.slice(0, 3) },
-            { label: "Recent", items: root.recent.filter(function(e) { return e.url !== root.playingUrl }).slice(0, 3) }
+            { kind: "favorites", label: "Favorites", total: root.favorites.length, items: root.favorites.slice(0, 3) },
+            { kind: "recent", label: "Recent", total: root.recent.length,
+              items: root.recent.filter(function(e) { return e.url !== root.playingUrl }).slice(0, 3) }
           ]
 
           Column {
+            id: savedSection
             required property var modelData
             visible: modelData.items.length > 0
             width: homeColumn.width
@@ -629,12 +715,36 @@ BarWidget {
 
             PanelSeparator { foreground: root.bar.foreground }
 
-            Text {
-              textFormat: Text.PlainText
-              text: modelData.label
-              color: Qt.darker(root.bar.foreground, 1.7)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
+            Item {
+              width: parent.width
+              height: sectionLabel.implicitHeight
+
+              Text {
+                id: sectionLabel
+                textFormat: Text.PlainText
+                text: savedSection.modelData.label
+                color: Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                anchors.right: parent.right
+                textFormat: Text.PlainText
+                text: "All " + savedSection.modelData.total + " ›"
+                color: allMouse.containsMouse ? Color.accent : Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+
+                MouseArea {
+                  id: allMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.browse(savedSection.modelData.kind)
+                }
+              }
             }
 
             Repeater {
@@ -676,7 +786,7 @@ BarWidget {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: root.loading ? "loading…" : (root.loadError ? "" : root.visibleResults.length + " results")
+            text: root.loading ? "loading…" : (root.loadError ? "" : root.visibleResults.length + (root.sources[root.browseKind].saved ? " saved" : " results"))
             color: Qt.darker(root.bar.foreground, 1.7)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -709,6 +819,9 @@ BarWidget {
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.submit()
               event.accepted = true
+            } else if (event.key === Qt.Key_Delete && text === "" && root.sources[root.browseKind].saved) {
+              root.removeSaved(root.visibleResults[root.selectedIndex])
+              event.accepted = true
             }
           }
         }
@@ -732,7 +845,9 @@ BarWidget {
               width: resultsView.width
               entry: modelData
               selected: index === root.selectedIndex
+              removable: root.sources[root.browseKind].saved === true
               onClicked: root.playResult(index)
+              onRemoveRequested: root.removeSaved(modelData)
               onHovered: root.selectedIndex = index
             }
           }
@@ -741,7 +856,8 @@ BarWidget {
             anchors.centerIn: parent
             visible: !root.loading && root.visibleResults.length === 0
             textFormat: Text.PlainText
-            text: root.loadError || "Nothing found"
+            text: root.loadError || (root.browseKind === "favorites" ? "No favorites yet; use the heart while something plays"
+              : root.browseKind === "recent" ? "Nothing played yet" : "Nothing found")
             color: Qt.darker(root.bar.foreground, 1.7)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall

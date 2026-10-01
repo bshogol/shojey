@@ -11,6 +11,7 @@
 #
 # State the bar popup reads:
 #   $XDG_RUNTIME_DIR/shojey/current.json   what was last started (gone when stopped)
+#   $XDG_RUNTIME_DIR/shojey/error.json     why playback ended on its own, if it failed
 #   $XDG_STATE_HOME/shojey/recent.json     last 10 things played
 #   $XDG_STATE_HOME/shojey/favorites.json  hearted entries
 # Each entry is {source, name, url, live, art}.
@@ -25,9 +26,11 @@ SOCKET="$RUNTIME_DIR/mpv.sock"
 PLAYLIST="$RUNTIME_DIR/queue.m3u"
 QUEUE="$RUNTIME_DIR/queue.json"
 CURRENT="$RUNTIME_DIR/current.json"
+ERROR="$RUNTIME_DIR/error.json"
+SESSION="$RUNTIME_DIR/session"
 RECENT="$STATE_DIR/recent.json"
 FAVORITES="$STATE_DIR/favorites.json"
-RECENT_MAX=10
+RECENT_MAX=30
 AUDIUS_API="https://api.audius.co/v1"
 RADIO_API="https://all.api.radio-browser.info/json"
 SOMA_API="https://somafm.com/channels.json"
@@ -128,27 +131,58 @@ ipc() {
   socat - "UNIX-CONNECT:$SOCKET" <<<"$1"
 }
 
+# Removing the session first tells the watcher this stop was on purpose.
 stop() {
+  rm -f "$SESSION"
   if running; then
     ipc '{"command":["quit"]}' >/dev/null || true
   fi
-  rm -f "$SOCKET" "$CURRENT"
+  rm -f "$SOCKET" "$CURRENT" "$ERROR" "$QUEUE"
 }
 
-# play <m3u-file> [start-index] [mpv flags...]
-# Replaces whatever is playing. An m3u with #EXTINF titles gives mpv (and so
-# MPRIS) a readable title for every entry, and lets next/previous walk the
-# rest of the result list.
-play_playlist() {
-  local file="$1" start="${2:-0}"
+# launch <m3u-file> [start-index] [mpv flags...]
+# Starts mpv in the background under a watcher. An m3u with #EXTINF titles
+# gives mpv (and so MPRIS) a readable title for every entry, and lets
+# next/previous walk the rest of the result list. Callers stop the old
+# player and write current.json first.
+launch() {
+  local file="$1" start="${2:-0}" session code
   shift 2
-  stop
-  # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
-  mpv --no-video --idle=no --no-terminal ${SHOJEY_MPV_ARGS:-} \
-    --input-ipc-server="$SOCKET" \
-    --playlist-start="$start" "$@" \
-    --playlist="$file" >/dev/null 2>&1 &
+  session="$$.$RANDOM.$(date +%s%N)"
+  echo "$session" >"$SESSION"
+  (
+    # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
+    mpv --no-video --idle=no --no-terminal ${SHOJEY_MPV_ARGS:-} \
+      --input-ipc-server="$SOCKET" \
+      --stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10 \
+      --playlist-start="$start" "$@" \
+      --playlist="$file" && code=0 || code=$?
+    playback_ended "$session" "$code"
+  ) >/dev/null 2>&1 &
   disown
+}
+
+# Runs when mpv exits. A newer play or a stop has replaced the session, so
+# only an exit nobody asked for gets here: a failed stream (mpv exits 2), a
+# live stream that ended, or a queue that played to the end.
+playback_ended() {
+  local session="$1" code="$2" e name live message
+  [[ -f $SESSION && $(<"$SESSION") == "$session" ]] || return 0
+  rm -f "$SESSION" "$SOCKET"
+  e=$(cat "$CURRENT" 2>/dev/null) || true
+  rm -f "$CURRENT" "$QUEUE"
+  [[ -n $e ]] || return 0
+  live=$(jq -r '.live // false' <<<"$e")
+  if (( code != 0 )); then
+    message="Couldn't play it; the stream may be offline"
+  elif [[ $live == true ]]; then
+    message="The stream stopped"
+  else
+    return 0
+  fi
+  name=$(jq -r '.name' <<<"$e")
+  jq -cn --argjson entry "$e" --arg message "$message" '{entry:$entry, message:$message}' | write_json "$ERROR"
+  notify "$name: $message"
 }
 
 # ccMixter only serves its mp3s to requests that come from its own site.
@@ -176,21 +210,23 @@ play_entry() {
   [[ -n $uuid ]] && { fetch "$RADIO_API/url/$uuid" >/dev/null 2>&1 & }
   e=$(jq -c --arg url "$url" '.url = $url | del(.uuid, .detail, .title)' <<<"$e")
   printf '#EXTM3U\n#EXTINF:-1,%s\n%s\n' "$name" "$url" >"$PLAYLIST"
+  stop
   rm -f "$QUEUE"
-  # shellcheck disable=SC2046 # zero or one flag
-  play_playlist "$PLAYLIST" 0 $(source_flags "$e")
   remember "$e"
+  # shellcheck disable=SC2046 # zero or one flag
+  launch "$PLAYLIST" 0 $(source_flags "$e")
 }
 
 # play_list <index> <entries-json>
 # Queues every entry so next / previous keep going through the list.
 play_list() {
   local index="$1"
+  stop
   jq -c 'map(del(.uuid, .detail, .title))' <<<"$2" | write_json "$QUEUE"
   jq -r '"#EXTM3U", (.[] | "#EXTINF:-1,\(.name)", .url)' "$QUEUE" >"$PLAYLIST"
-  # shellcheck disable=SC2046 # zero or one flag
-  play_playlist "$PLAYLIST" "$index" $(source_flags "$2")
   remember "$(jq -c ".[$index]" "$QUEUE")"
+  # shellcheck disable=SC2046 # zero or one flag
+  launch "$PLAYLIST" "$index" $(source_flags "$2")
 }
 
 play_saved() {
@@ -200,9 +236,25 @@ play_saved() {
   play_entry "$e"
 }
 
+# Pause / resume; with nothing running, play the last thing again.
 toggle() {
-  running || return 0
-  ipc '{"command":["cycle","pause"]}' >/dev/null
+  if running; then
+    ipc '{"command":["cycle","pause"]}' >/dev/null
+  else
+    resume
+  fi
+}
+
+resume() {
+  local url
+  url=$(jq -r '.[0].url // empty' "$RECENT")
+  [[ -n $url ]] || return 0
+  play_saved "$url"
+}
+
+forget() {
+  [[ -n ${1:-} ]] || fail "forget needs a url"
+  jq -c --arg url "$1" 'map(select(.url != $url))' "$RECENT" | write_json "$RECENT"
 }
 
 status() {
@@ -425,7 +477,10 @@ Usage: shojey <command>
   play-list <i> <json> queue a \`list\` result and start at index i
   play-saved <url>     replay a recent or favorite entry
   fav [url] [title]    toggle a favorite (default: what's playing)
-  toggle               pause / resume
+  forget <url>         remove an entry from recent plays
+  resume               play the most recent entry again
+  dismiss              clear the last playback error
+  toggle               pause / resume (resumes the last entry when stopped)
   stop                 stop playback
   status               print player state as JSON
 USAGE
@@ -461,6 +516,9 @@ case "${1:-menu}" in
     ;;
   fav) toggle_favorite "${2:-}" "${3:-}" ;;
   toggle) toggle ;;
+  resume) resume ;;
+  forget) forget "${2:-}" ;;
+  dismiss) rm -f "$ERROR" ;;
   stop) stop ;;
   status) status ;;
   -h | --help | help) usage ;;

@@ -30,7 +30,14 @@ through them.
 The card shows artwork, track and source, prev / play / next / favorite, a
 LIVE marker or track position, buttons for each source, and your favorites and
 recent plays. Everything happens in the card: pick a source and its channels or
-search results open in place.
+search results open in place. "All ›" opens the full favorites or recent list,
+where ✕ (or Delete) removes an entry.
+
+When nothing is playing the card offers to resume the last thing you played
+(right-clicking the icon does the same). If a stream fails or drops for good,
+the card says so and offers Retry; short network drops reconnect on their own.
+The card only follows the mpv that shojey started, so a video playing in
+another mpv doesn't take it over.
 
 Keys: space play/pause, ←/→ previous/next, f favorite, s/p/r/a/c open
 SomaFM/Paradise/Radio/Audius/ccMixter, ↑/↓ and enter in a list, esc back.
@@ -50,10 +57,12 @@ bin/shojey list <source> [query]  print a source's entries as JSON
 bin/shojey play <url> [title]   play a stream or file
 bin/shojey play-saved <url>     replay a recent or favorite entry
 bin/shojey fav [url] [title]    toggle a favorite (default: what's playing)
-bin/shojey toggle|stop|status
+bin/shojey forget <url>         remove an entry from recent plays
+bin/shojey resume|dismiss       play the last entry again / clear an error
+bin/shojey toggle|stop|status   toggle resumes the last entry when stopped
 ```
 
-State lives in `$XDG_RUNTIME_DIR/shojey/` (what's playing) and
+State lives in `$XDG_RUNTIME_DIR/shojey/` (what's playing, the last error) and
 `$XDG_STATE_HOME/shojey/` (`recent.json`, `favorites.json`).
 
 `SHOJEY_MPV_ARGS` passes extra flags to mpv (e.g. `--ao=null` for silent tests).

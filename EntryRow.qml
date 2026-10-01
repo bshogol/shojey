@@ -18,11 +18,15 @@ BorderSurface {
   property var entry: null
   property bool compact: false
   property bool selected: false
+  // Shows a remove button on hover (favorites and recent views).
+  property bool removable: false
+  readonly property bool showRemove: removable && (rowMouse.containsMouse || removeMouse.containsMouse || selected)
   readonly property bool isPlaying: entry && entry.url === row.playingUrl
   readonly property bool isFavorite: entry && row.favorites.some(function(f) { return f.url === row.entry.url })
 
   signal clicked()
   signal hovered()
+  signal removeRequested()
 
   height: (compact ? Style.space(28) : Style.space(44))
   radius: Style.spacing.labelGap
@@ -95,7 +99,8 @@ BorderSurface {
       anchors.verticalCenter: parent.verticalCenter
       horizontalAlignment: Text.AlignRight
       textFormat: Text.PlainText
-      text: row.isPlaying ? (row.playerPlaying ? row.glyph("glyphNote") : row.glyph("glyphPause"))
+      text: row.showRemove ? row.glyph("glyphClose")
+        : row.isPlaying ? (row.playerPlaying ? row.glyph("glyphNote") : row.glyph("glyphPause"))
         : row.isFavorite ? row.glyph("glyphHeart")
         : row.compact && row.entry ? row.entry.source.slice(0, 1) : ""
       color: row.isPlaying || row.isFavorite ? Color.accent : Qt.darker(row.fg, 1.7)
@@ -111,5 +116,17 @@ BorderSurface {
     cursorShape: Qt.PointingHandCursor
     onClicked: row.clicked()
     onEntered: row.hovered()
+  }
+
+  MouseArea {
+    id: removeMouse
+    visible: row.removable
+    anchors.right: parent.right
+    anchors.top: parent.top
+    anchors.bottom: parent.bottom
+    width: Style.space(40)
+    hoverEnabled: true
+    cursorShape: Qt.PointingHandCursor
+    onClicked: row.removeRequested()
   }
 }
