@@ -6,6 +6,12 @@ Pick something from the bar, it plays through `mpv` in the background. Because
 the system `mpv-mpris` script exposes mpv over MPRIS, Omarchy's media keys, OSD
 and media widget control it like any other player.
 
+<p>
+  <img src="screenshots/card.png" width="270" alt="The now-playing card under the bar: artwork, controls, sources and recent plays">
+  <img src="screenshots/somafm.png" width="270" alt="Browsing SomaFM channels inside the card">
+  <img src="screenshots/audius.png" width="270" alt="Trending Audius tracks inside the card">
+</p>
+
 ## Sources
 
 | Source | What | Key needed |
@@ -75,7 +81,7 @@ and `omarchy-menu-input`.
 ## Install
 
 ```
-omarchy plugin add <git-url> --enable
+omarchy plugin add https://github.com/bshogol/shojey --enable
 ```
 
 For development, symlink the checkout instead:
