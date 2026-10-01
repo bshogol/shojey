@@ -12,9 +12,11 @@ import qs.Ui
 //   left click    open / close the card
 //   right click   play / pause
 //   middle click  stop
+//   scroll        volume
 //
-// Keys in the card: space play/pause, ←/→ previous/next, f favorite,
-// s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/ccMixter, esc back or close.
+// Keys in the card: space play/pause, ←/→ previous/next, ↑/↓ volume,
+// f favorite, t sleep timer, s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/
+// ccMixter, o songs heard on air, esc back or close.
 BarWidget {
   id: root
   moduleName: "boris.shojey"
@@ -36,15 +38,21 @@ BarWidget {
   readonly property string glyphBack: String.fromCodePoint(0xf004d)
   readonly property string glyphClose: String.fromCodePoint(0xf0156)
   readonly property string glyphRetry: String.fromCodePoint(0xf0450)
+  readonly property string glyphSleep: String.fromCodePoint(0xf04b2)
+  readonly property string glyphVolume: String.fromCodePoint(0xf057e)
+  readonly property string glyphVolumeLow: String.fromCodePoint(0xf057f)
+  readonly property string glyphVolumeOff: String.fromCodePoint(0xf0581)
 
   readonly property var sources: ({
     soma: { title: "SomaFM", placeholder: "Filter channels", local: true },
     paradise: { title: "Radio Paradise", placeholder: "Filter channels", local: true },
-    radio: { title: "Radio", placeholder: "Search stations (top voted shown)" },
+    radio: { title: "Radio", placeholder: "Name, tag or country (top voted shown)" },
     audius: { title: "Audius", placeholder: "Search tracks (trending shown)", queue: true },
     ccmixter: { title: "ccMixter", placeholder: "Search tracks (editor's picks shown)", queue: true },
     favorites: { title: "Favorites", placeholder: "Filter favorites", local: true, saved: true },
-    recent: { title: "Recent", placeholder: "Filter recent plays", local: true, saved: true }
+    recent: { title: "Recent", placeholder: "Filter recent plays", local: true, saved: true },
+    // Songs the live stations announced; picking one copies its title.
+    history: { title: "Heard on air", placeholder: "Filter songs", local: true, saved: true, copy: true }
   })
 
   // mpv-mpris registers every mpv as identity "mpv", so only count the one
@@ -69,7 +77,14 @@ BarWidget {
   property var recent: []
   property var favorites: []
   property var queue: []
+  property var history: []
   property var lastError: null          // {entry, message} when playback failed
+  property var sleepTimer: null         // {minutes, until} while a sleep timer runs
+  property real now: Date.now()
+  readonly property int sleepLeft: sleepTimer ? Math.max(1, Math.ceil((sleepTimer.until - now / 1000) / 60)) : 0
+
+  // mpv's own volume, not the system's.
+  readonly property real volume: player && player.volumeSupported ? player.volume : 1
 
   // Started but not on MPRIS yet: mpv is still connecting.
   readonly property bool connecting: player === null && current !== null
@@ -110,7 +125,8 @@ BarWidget {
   property int requestSeq: 0
 
   readonly property var browseList: browseKind === "favorites" ? favorites
-    : browseKind === "recent" ? recent : results
+    : browseKind === "recent" ? recent
+    : browseKind === "history" ? history : results
   readonly property var visibleResults: {
     if (!sources[browseKind].local || !searchField.text) return browseList
     var q = searchField.text.toLowerCase()
@@ -155,6 +171,8 @@ BarWidget {
     favoritesFile.reload()
     queueFile.reload()
     errorFile.reload()
+    historyFile.reload()
+    sleepFile.reload()
   }
 
   function formatTime(seconds) {
@@ -167,6 +185,26 @@ BarWidget {
     if (!root.playingUrl) return
     // A live station is favorited as the station, a track as itself.
     shojey(root.live ? ["fav", root.playingUrl] : ["fav", root.playingUrl, root.rawTitle])
+  }
+
+  // Set over MPRIS so the slider follows live; the script stores the level
+  // once it settles, for the next play.
+  function setVolume(v) {
+    if (!player || !player.volumeSupported) return
+    player.volume = Math.max(0, Math.min(1, v))
+    volumeSave.restart()
+  }
+
+  // off → 15 → 30 → 60 minutes → off
+  function cycleSleep() {
+    var minutes = sleepTimer ? sleepTimer.minutes : 0
+    var next = minutes < 15 ? 15 : minutes < 30 ? 30 : minutes < 60 ? 60 : 0
+    shojey(["sleep", next ? String(next) : "off"])
+  }
+
+  function activateSaved(kind, entry) {
+    if (sources[kind].copy) shojey(["copy", entry.name])
+    else shojey(["play-saved", entry.url])
   }
 
   function browse(kind) {
@@ -240,6 +278,10 @@ BarWidget {
   function playResult(index) {
     var list = visibleResults
     if (index < 0 || index >= list.length) return
+    if (sources[browseKind].copy) {
+      shojey(["copy", list[index].name])
+      return
+    }
     // Track results play as a queue so next / previous walk the list.
     if (sources[browseKind].saved) shojey(["play-saved", list[index].url])
     else if (sources[browseKind].queue) shojey(["play-list", String(index), JSON.stringify(list)])
@@ -250,7 +292,7 @@ BarWidget {
   function removeSaved(entry) {
     if (!entry) return
     if (browseKind === "favorites") shojey(["fav", entry.url])
-    else if (browseKind === "recent") shojey(["forget", entry.url])
+    else shojey(["forget", entry.url])
   }
 
   function moveSelection(delta) {
@@ -261,8 +303,10 @@ BarWidget {
   }
 
   onPopupOpenChanged: {
-    if (popupOpen) reload()
-    else {
+    if (popupOpen) {
+      now = Date.now()
+      reload()
+    } else {
       view = "home"
       searchDebounce.stop()
     }
@@ -334,6 +378,29 @@ BarWidget {
     onLoadFailed: root.queue = []
   }
 
+  FileView {
+    id: historyFile
+    path: root.stateDir + "/history.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.history = root.parse(historyFile, [])
+    onLoadFailed: root.history = []
+  }
+
+  FileView {
+    id: sleepFile
+    path: root.runtimeDir + "/sleep.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      root.now = Date.now()
+      root.sleepTimer = root.parse(sleepFile, null)
+    }
+    onLoadFailed: root.sleepTimer = null
+  }
+
   Process {
     id: listProc
     running: false
@@ -385,6 +452,20 @@ BarWidget {
     onTriggered: root.fetchResults(searchField.text)
   }
 
+  Timer {
+    id: volumeSave
+    interval: 500
+    onTriggered: if (root.player) root.shojey(["volume", String(Math.round(root.player.volume * 100))])
+  }
+
+  // Keeps the sleep countdown on the card current.
+  Timer {
+    interval: 10000
+    repeat: true
+    running: root.popupOpen && root.sleepTimer !== null
+    onTriggered: root.now = Date.now()
+  }
+
   // MPRIS position is not pushed; poll it while the card shows a track bar.
   Timer {
     interval: 1000
@@ -410,6 +491,7 @@ BarWidget {
       else if (b === Qt.MiddleButton) root.shojey(["stop"])
       else root.popupOpen = !root.popupOpen
     }
+    onWheelMoved: function(delta) { root.setVolume(root.volume + (delta > 0 ? 0.05 : -0.05)) }
   }
 
   // KeyboardPanel rather than PopupCard: it takes keyboard focus, which the
@@ -435,6 +517,7 @@ BarWidget {
         if (!root.player) return
         if (dx < 0 && root.player.canGoPrevious) root.player.previous()
         else if (dx > 0 && root.player.canGoNext) root.player.next()
+        else if (dy !== 0) root.setVolume(root.volume - dy * 0.05)
       }
       onTextKey: function(text) {
         if (text === "s") root.browse("soma")
@@ -442,7 +525,9 @@ BarWidget {
         else if (text === "c") root.browse("ccmixter")
         else if (text === "r") root.browse("radio")
         else if (text === "a") root.browse("audius")
+        else if (text === "o") root.browse("history")
         else if (text === "f") root.toggleFavorite()
+        else if (text === "t" && root.player) root.cycleSleep()
       }
 
       // ================= home: now playing ===============================
@@ -575,6 +660,15 @@ BarWidget {
             enabled: root.playingUrl !== ""
             onClicked: root.toggleFavorite()
           }
+
+          Button {
+            iconText: root.glyphSleep
+            text: root.sleepTimer ? root.sleepLeft + "m" : ""
+            bordered: true
+            foreground: root.sleepTimer ? Color.accent : root.bar.foreground
+            tooltipText: root.sleepTimer ? "Stops in " + root.sleepLeft + " min; click to change" : "Sleep timer"
+            onClicked: root.cycleSleep()
+          }
         }
 
         // Nothing playing: retry a failed stream, or pick up where you left off.
@@ -654,6 +748,30 @@ BarWidget {
               font.pixelSize: Style.font.caption
             }
           }
+
+          Row {
+            visible: root.player !== null && root.player.volumeSupported
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              id: volumeGlyph
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: root.volume <= 0 ? root.glyphVolumeOff : root.volume < 0.5 ? root.glyphVolumeLow : root.glyphVolume
+              color: Qt.darker(root.bar.foreground, 1.3)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            PanelSlider {
+              bar: root.bar
+              width: parent.width - volumeGlyph.width - parent.spacing
+              anchors.verticalCenter: parent.verticalCenter
+              value: root.volume
+              onMoved: function(v) { root.setVolume(v) }
+            }
+          }
         }
 
         // Stations on top, on-demand tracks below.
@@ -703,7 +821,9 @@ BarWidget {
           model: [
             { kind: "favorites", label: "Favorites", total: root.favorites.length, items: root.favorites.slice(0, 3) },
             { kind: "recent", label: "Recent", total: root.recent.length,
-              items: root.recent.filter(function(e) { return e.url !== root.playingUrl }).slice(0, 3) }
+              items: root.recent.filter(function(e) { return e.url !== root.playingUrl }).slice(0, 3) },
+            { kind: "history", label: "Heard on air", total: root.history.length,
+              items: root.history.filter(function(e) { return e.name !== root.rawTitle }).slice(0, 3) }
           ]
 
           Column {
@@ -756,7 +876,7 @@ BarWidget {
                 width: homeColumn.width
                 entry: modelData
                 compact: true
-                onClicked: root.shojey(["play-saved", modelData.url])
+                onClicked: root.activateSaved(savedSection.modelData.kind, modelData)
               }
             }
           }
@@ -857,7 +977,8 @@ BarWidget {
             visible: !root.loading && root.visibleResults.length === 0
             textFormat: Text.PlainText
             text: root.loadError || (root.browseKind === "favorites" ? "No favorites yet; use the heart while something plays"
-              : root.browseKind === "recent" ? "Nothing played yet" : "Nothing found")
+              : root.browseKind === "recent" ? "Nothing played yet"
+              : root.browseKind === "history" ? "No songs yet; they show up as stations play" : "Nothing found")
             color: Qt.darker(root.bar.foreground, 1.7)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall

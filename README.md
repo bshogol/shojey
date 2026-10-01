@@ -18,12 +18,13 @@ and media widget control it like any other player.
 |---|---|---|
 | [SomaFM](https://somafm.com) | ~45 curated, ad-free radio channels | no |
 | [Radio Paradise](https://radioparadise.com) | 7 ad-free channels, with cover art for the song on air | no |
-| [Radio Browser](https://www.radio-browser.info) | ~50k community-listed internet radio stations | no |
+| [Radio Browser](https://www.radio-browser.info) | ~50k community-listed internet radio stations; search by name, tag or country | no |
 | [Audius](https://audius.co) | on-demand tracks: trending and search | no |
 | [ccMixter](https://ccmixter.org) | Creative Commons tracks and remixes: editor's picks and search | no |
 
 Audius and ccMixter results are queued as a playlist, so next / previous walk
-through them.
+through them. Source lists are cached for ten minutes, so reopening one is
+instant, and the last copy is shown if a refresh fails.
 
 ## Bar widget
 
@@ -32,10 +33,11 @@ through them.
 | left | open the now-playing card |
 | right | play / pause |
 | middle | stop |
+| scroll | volume |
 
 The card shows artwork, track and source, prev / play / next / favorite, a
-LIVE marker or track position, buttons for each source, and your favorites and
-recent plays. Everything happens in the card: pick a source and its channels or
+sleep timer, a LIVE marker or track position, a volume slider, buttons for
+each source, and your favorites and recent plays. Everything happens in the card: pick a source and its channels or
 search results open in place. "All ›" opens the full favorites or recent list,
 where ✕ (or Delete) removes an entry.
 
@@ -45,8 +47,17 @@ the card says so and offers Retry; short network drops reconnect on their own.
 The card only follows the mpv that shojey started, so a video playing in
 another mpv doesn't take it over.
 
-Keys: space play/pause, ←/→ previous/next, f favorite, s/p/r/a/c open
-SomaFM/Paradise/Radio/Audius/ccMixter, ↑/↓ and enter in a list, esc back.
+The volume is mpv's own, separate from the system volume, and is kept for the
+next play. The sleep timer button steps through 15, 30 and 60 minutes and off;
+playback stops when it runs out.
+
+Every song a live station announces is logged under "Heard on air", so you can
+look up what was playing earlier. Picking a song copies its title to the
+clipboard.
+
+Keys: space play/pause, ←/→ previous/next, ↑/↓ volume, f favorite, t sleep
+timer, s/p/r/a/c open SomaFM/Paradise/Radio/Audius/ccMixter, o songs heard on
+air, ↑/↓ and enter in a list, esc back.
 
 Bind the card to a key with:
 
@@ -63,20 +74,25 @@ bin/shojey list <source> [query]  print a source's entries as JSON
 bin/shojey play <url> [title]   play a stream or file
 bin/shojey play-saved <url>     replay a recent or favorite entry
 bin/shojey fav [url] [title]    toggle a favorite (default: what's playing)
-bin/shojey forget <url>         remove an entry from recent plays
+bin/shojey forget <url>         remove an entry from recent plays or the song history
+bin/shojey volume [N|+N|-N]     print or set the player volume, 0-100
+bin/shojey sleep [minutes|off]  stop playback after a while
 bin/shojey resume|dismiss       play the last entry again / clear an error
 bin/shojey toggle|stop|status   toggle resumes the last entry when stopped
 ```
 
-State lives in `$XDG_RUNTIME_DIR/shojey/` (what's playing, the last error) and
-`$XDG_STATE_HOME/shojey/` (`recent.json`, `favorites.json`).
+State lives in `$XDG_RUNTIME_DIR/shojey/` (what's playing, the last error, the
+sleep timer) and `$XDG_STATE_HOME/shojey/` (`recent.json`, `favorites.json`,
+`history.json`, `volume`). Cached source lists are in `$XDG_CACHE_HOME/shojey/`.
 
 `SHOJEY_MPV_ARGS` passes extra flags to mpv (e.g. `--ao=null` for silent tests).
+`SHOJEY_CACHE_TTL` sets how many seconds a source list is cached (default 600;
+0 turns the cache off).
 
 ## Requirements
 
-`mpv`, `mpv-mpris`, `socat`, `jq`, `curl` — plus Omarchy's `omarchy-menu-select`
-and `omarchy-menu-input`.
+`mpv`, `mpv-mpris`, `socat`, `jq`, `curl`, `wl-clipboard` — plus Omarchy's
+`omarchy-menu-select` and `omarchy-menu-input`.
 
 ## Install
 

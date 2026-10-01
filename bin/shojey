@@ -12,25 +12,33 @@
 # State the bar popup reads:
 #   $XDG_RUNTIME_DIR/shojey/current.json   what was last started (gone when stopped)
 #   $XDG_RUNTIME_DIR/shojey/error.json     why playback ended on its own, if it failed
-#   $XDG_STATE_HOME/shojey/recent.json     last 10 things played
+#   $XDG_RUNTIME_DIR/shojey/sleep.json     the sleep timer, while one is set
+#   $XDG_STATE_HOME/shojey/recent.json     last 30 things played
 #   $XDG_STATE_HOME/shojey/favorites.json  hearted entries
+#   $XDG_STATE_HOME/shojey/history.json    songs heard on live stations
 # Each entry is {source, name, url, live, art}.
 
 set -euo pipefail
 
 APP_NAME="shojey"
-USER_AGENT="shojey/0.1"
+USER_AGENT="shojey/0.2"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/shojey"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shojey"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/shojey"
 SOCKET="$RUNTIME_DIR/mpv.sock"
 PLAYLIST="$RUNTIME_DIR/queue.m3u"
 QUEUE="$RUNTIME_DIR/queue.json"
 CURRENT="$RUNTIME_DIR/current.json"
 ERROR="$RUNTIME_DIR/error.json"
 SESSION="$RUNTIME_DIR/session"
+SLEEP="$RUNTIME_DIR/sleep.json"
 RECENT="$STATE_DIR/recent.json"
 FAVORITES="$STATE_DIR/favorites.json"
+HISTORY="$STATE_DIR/history.json"
+VOLUME="$STATE_DIR/volume"
 RECENT_MAX=30
+HISTORY_MAX=200
+CACHE_TTL="${SHOJEY_CACHE_TTL:-600}"
 AUDIUS_API="https://api.audius.co/v1"
 RADIO_API="https://all.api.radio-browser.info/json"
 SOMA_API="https://somafm.com/channels.json"
@@ -46,9 +54,10 @@ ICON_STOP=$'\U000f04db'
 ICON_PAUSE=$'\U000f03e4'
 ICON_HEART=$'\U000f02d1'
 
-mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
+mkdir -p "$RUNTIME_DIR" "$STATE_DIR" "$CACHE_DIR"
 [[ -f $RECENT ]] || echo '[]' >"$RECENT"
 [[ -f $FAVORITES ]] || echo '[]' >"$FAVORITES"
+[[ -f $HISTORY ]] || echo '[]' >"$HISTORY"
 
 fail() {
   echo "shojey: $*" >&2
@@ -147,17 +156,20 @@ stop() {
 # next/previous walk the rest of the result list. Callers stop the old
 # player and write current.json first.
 launch() {
-  local file="$1" start="${2:-0}" session code
+  local file="$1" start="${2:-0}" session code pid
   shift 2
   session="$$.$RANDOM.$(date +%s%N)"
   echo "$session" >"$SESSION"
   (
     # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
-    mpv --no-video --idle=no --no-terminal ${SHOJEY_MPV_ARGS:-} \
+    mpv --no-video --idle=no --no-terminal --volume="$(saved_volume)" ${SHOJEY_MPV_ARGS:-} \
       --input-ipc-server="$SOCKET" \
       --stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10 \
       --playlist-start="$start" "$@" \
-      --playlist="$file" && code=0 || code=$?
+      --playlist="$file" &
+    pid=$!
+    watch_titles &
+    wait "$pid" && code=0 || code=$?
     playback_ended "$session" "$code"
   ) >/dev/null 2>&1 &
   disown
@@ -184,6 +196,35 @@ playback_ended() {
   name=$(jq -r '.name' <<<"$e")
   jq -cn --argjson entry "$e" --arg message "$message" '{entry:$entry, message:$message}' | write_json "$ERROR"
   notify "$name: $message"
+}
+
+# Logs each song a live station announces, so "what was that?" has an answer
+# later. Follows mpv's title over its IPC socket and ends when mpv does.
+watch_titles() {
+  local e station title
+  e=$(cat "$CURRENT" 2>/dev/null) || return 0
+  [[ $(jq -r '.live // false' <<<"$e") == true ]] || return 0
+  station=$(jq -r '.name' <<<"$e")
+  for _ in {1..50}; do
+    [[ -S $SOCKET ]] && break
+    sleep 0.1
+  done
+  # ignoreeof keeps socat reading after the one command has been sent.
+  socat STDIO,ignoreeof "UNIX-CONNECT:$SOCKET" <<<'{"command":["observe_property",1,"media-title"]}' 2>/dev/null \
+    | jq --unbuffered -r 'select(.event == "property-change" and .name == "media-title") | .data // empty' \
+    | while IFS= read -r title; do
+      # Until the stream sends a song, the title is the station's own name.
+      [[ -n $title && $title != "$station" && $title != http* ]] || continue
+      log_song "$e" "$title"
+    done
+}
+
+log_song() {
+  jq -c --argjson e "$1" --arg title "$2" --arg when "$(date '+%b %-d %H:%M')" --argjson max "$HISTORY_MAX" '
+    if (.[0].name // "") == $title then . else
+      [{source: $e.source, name: $title, url: ("history:" + (now * 1000 | floor | tostring)),
+        live: false, art: ($e.art // ""), detail: ($e.name + " · " + $when)}] + . | .[:$max]
+    end' "$HISTORY" | write_json "$HISTORY"
 }
 
 # ccMixter only serves its mp3s to requests that come from its own site.
@@ -255,7 +296,78 @@ resume() {
 
 forget() {
   [[ -n ${1:-} ]] || fail "forget needs a url"
-  jq -c --arg url "$1" 'map(select(.url != $url))' "$RECENT" | write_json "$RECENT"
+  local file
+  for file in "$RECENT" "$HISTORY"; do
+    jq -c --arg url "$1" 'map(select(.url != $url))' "$file" | write_json "$file"
+  done
+}
+
+copy_text() {
+  [[ -n ${1:-} ]] || fail "copy needs some text"
+  wl-copy -- "$1" || fail "could not copy to the clipboard"
+  notify "Copied: $1"
+}
+
+saved_volume() {
+  local level
+  level=$(cat "$VOLUME" 2>/dev/null) || true
+  [[ $level =~ ^[0-9]+$ ]] && echo "$level" || echo 100
+}
+
+# volume [N|+N|-N] — mpv's own volume, 0-100, kept for the next play. Prints
+# the level.
+volume() {
+  local arg="${1:-}" level
+  level=$(saved_volume)
+  if running; then
+    level=$(ipc '{"command":["get_property","volume"]}' | jq -r '.data // 100 | round')
+  fi
+  if [[ -n $arg ]]; then
+    [[ $arg =~ ^[+-]?[0-9]+$ ]] || fail "volume needs a level from 0 to 100, or +N / -N"
+    case "$arg" in
+      [+-]*) level=$((level + arg)) ;;
+      *) level=$((10#$arg)) ;;
+    esac
+    ((level < 0)) && level=0
+    ((level > 100)) && level=100
+    echo "$level" >"$VOLUME"
+    if running; then
+      ipc "{\"command\":[\"set_property\",\"volume\",$level]}" >/dev/null
+    fi
+  fi
+  echo "$level"
+}
+
+# sleep_timer [minutes|off] — stop playback after a while; prints the timer
+# as JSON. The waiter only acts while its token is the one on file, so
+# setting a new timer or cancelling retires the old waiter within seconds.
+sleep_timer() {
+  local minutes="${1:-}" token until
+  if [[ -n $minutes ]]; then
+    rm -f "$SLEEP"
+    if [[ $minutes != off && $minutes != 0 ]]; then
+      [[ $minutes =~ ^[0-9]+$ ]] || fail "sleep needs a number of minutes, or off"
+      token="$$.$RANDOM"
+      until=$(($(date +%s) + 10#$minutes * 60))
+      jq -cn --arg token "$token" --argjson minutes "$((10#$minutes))" --argjson until "$until" \
+        '{token:$token, minutes:$minutes, until:$until}' | write_json "$SLEEP"
+      (
+        while [[ -f $SLEEP && $(<"$SLEEP") == *"\"$token\""* ]]; do
+          if (($(date +%s) >= until)); then
+            rm -f "$SLEEP"
+            if running; then
+              stop
+              notify "Sleep timer: playback stopped"
+            fi
+            break
+          fi
+          sleep 5
+        done
+      ) >/dev/null 2>&1 &
+      disown
+    fi
+  fi
+  cat "$SLEEP" 2>/dev/null || echo '{}'
 }
 
 status() {
@@ -280,20 +392,57 @@ list_soma() {
            art: (.largeimage // .image // ""), detail: ((.genre | gsub("\\|"; ", ")) + " · " + .description)})'
 }
 
-# list_radio [query] — top voted stations without a query.
-list_radio() {
-  local url
-  if [[ -n ${1:-} ]]; then
-    url="$RADIO_API/stations/search?name=$(uri "$1")&limit=40&hidebroken=true&order=clickcount&reverse=true"
-  else
-    url="$RADIO_API/stations/topvote/40?hidebroken=true"
+# Radio Browser's country for a query: its code, its name, or a good part of
+# its name ("korea"). Prints the two-letter code, or nothing.
+radio_country() {
+  local file="$CACHE_DIR/countries.json" out
+  if [[ ! -s $file ]]; then
+    out=$(fetch "$RADIO_API/countries") && [[ -n $out ]] && write_json "$file" <<<"$out"
   fi
-  fetch "$url" | jq -c '
-    map(select(.url_resolved != "")
+  [[ -s $file ]] || return 0
+  jq -r --arg q "$1" '
+    ($q | ascii_downcase) as $q
+    | (map(select((.name | ascii_downcase) == $q or (.iso_3166_1 | ascii_downcase) == $q))
+       + (if ($q | length) < 4 then [] else
+            map(select(.name | ascii_downcase | contains($q))) | sort_by(-.stationcount) end))
+    | first | .iso_3166_1 // empty' "$file"
+}
+
+# list_radio [query] — top voted stations without a query. A query matches
+# countries, station names and tags, in that order. The API searches one
+# field per request, so each is fetched and the results are merged.
+list_radio() {
+  local query="${1:-}" q code search dir url n=0 urls=()
+  if [[ -n $query ]]; then
+    q=$(uri "$query")
+    code=$(radio_country "$query") || true
+    search="$RADIO_API/stations/search?limit=40&hidebroken=true&order=clickcount&reverse=true"
+    [[ -n $code ]] && urls+=("$search&countrycode=$code")
+    # A bare country code is not worth matching against names and tags.
+    [[ -n $code && ${#query} -eq 2 ]] || urls+=("$search&name=$q" "$search&tag=$q")
+  else
+    urls=("$RADIO_API/stations/topvote/40?hidebroken=true")
+  fi
+  dir=$(mktemp -d "$RUNTIME_DIR/radio.XXXXXX")
+  for url in "${urls[@]}"; do
+    fetch "$url" >"$dir/$n.json" &
+    n=$((n + 1))
+  done
+  wait
+  jq -cs --arg q "$query" '
+    ($q | ascii_downcase) as $q
+    | reduce (add | .[]) as $s ({seen: {}, out: []};
+        if .seen[$s.stationuuid] then . else .seen[$s.stationuuid] = true | .out += [$s] end)
+    | .out[:60]
+    | map(select(.url_resolved != "")
+      | (.tags | split(",")) as $tags
       | {source: "Radio", name: (.name | gsub("^\\s+|\\s+$"; "")), url: .url_resolved, live: true,
          art: (.favicon // ""), uuid: .stationuuid,
-         detail: ([.countrycode, .codec, ((.bitrate|tostring) + "k"), (.tags | split(",")[:3] | join(", "))]
-                  | map(select(. != "" and . != "0k")) | join(" · "))})'
+         detail: ([.countrycode, .codec, ((.bitrate|tostring) + "k"),
+                   ($tags | map(select(contains($q))) + map(select(contains($q) | not)) | .[:3] | join(", "))]
+                  | map(select(. != "" and . != "0k")) | join(" · "))})' "$dir"/*.json && n=0 || n=$?
+  rm -rf "$dir"
+  return "$n"
 }
 
 # list_audius [query] — trending without a query.
@@ -350,16 +499,33 @@ list_ccmixter() {
                   | map(select(. != "")) | join(" · "))})'
 }
 
+# Source lists are cached for a few minutes so reopening a source is instant;
+# when a refresh fails, the last copy is served instead.
+cached_list() {
+  local kind="$1" query="${2:-}" file out
+  file="$CACHE_DIR/$kind.$(printf '%s' "$query" | md5sum | cut -c1-12).json"
+  if [[ -s $file ]] && (($(date +%s) - $(stat -c %Y "$file") < CACHE_TTL)); then
+    cat "$file"
+    return
+  fi
+  if out=$("list_$kind" "$query") && [[ -n $out ]]; then
+    write_json "$file" <<<"$out"
+    find "$CACHE_DIR" -name '*.json' -mmin +1440 -delete 2>/dev/null || true
+    echo "$out"
+  elif [[ -s $file ]]; then
+    cat "$file"
+  else
+    return 1
+  fi
+}
+
 list() {
   case "${1:-}" in
-    soma) list_soma ;;
-    radio) list_radio "${2:-}" ;;
-    audius) list_audius "${2:-}" ;;
-    paradise) list_paradise ;;
-    ccmixter) list_ccmixter "${2:-}" ;;
+    soma | paradise | radio | audius | ccmixter) cached_list "$1" "${2:-}" ;;
     favorites) cat "$FAVORITES" ;;
     recent) cat "$RECENT" ;;
-    *) fail "list: expected soma, paradise, radio, audius, ccmixter, favorites or recent" ;;
+    history) cat "$HISTORY" ;;
+    *) fail "list: expected soma, paradise, radio, audius, ccmixter, favorites, recent or history" ;;
   esac
 }
 
@@ -393,33 +559,33 @@ menu_list() {
 }
 
 menu_soma() {
-  menu_list "SomaFM" "$(list_soma || fail "could not load SomaFM channels")" "$ICON_RADIO"
+  menu_list "SomaFM" "$(list soma || fail "could not load SomaFM channels")" "$ICON_RADIO"
 }
 
 menu_radio() {
   local query
-  query=$(omarchy-menu-input "Search radio (name or tag)") || return 0
+  query=$(omarchy-menu-input "Search radio (name, tag or country)") || return 0
   [[ -n $query ]] || return 0
-  menu_list "Radio · $query" "$(list_radio "$query" || fail "Radio Browser search failed")" "$ICON_RADIO"
+  menu_list "Radio · $query" "$(list radio "$query" || fail "Radio Browser search failed")" "$ICON_RADIO"
 }
 
 menu_paradise() {
-  menu_list "Radio Paradise" "$(list_paradise || fail "could not load Radio Paradise channels")" "$ICON_RADIO"
+  menu_list "Radio Paradise" "$(list paradise || fail "could not load Radio Paradise channels")" "$ICON_RADIO"
 }
 
 menu_ccmixter() {
-  menu_list "ccMixter · Editor's picks" "$(list_ccmixter || fail "could not load ccMixter")" "$ICON_MUSIC" queue
+  menu_list "ccMixter · Editor's picks" "$(list ccmixter || fail "could not load ccMixter")" "$ICON_MUSIC" queue
 }
 
 menu_audius_trending() {
-  menu_list "Audius · Trending" "$(list_audius || fail "could not load Audius trending")" "$ICON_MUSIC" queue
+  menu_list "Audius · Trending" "$(list audius || fail "could not load Audius trending")" "$ICON_MUSIC" queue
 }
 
 menu_audius_search() {
   local query
   query=$(omarchy-menu-input "Search Audius tracks") || return 0
   [[ -n $query ]] || return 0
-  menu_list "Audius · $query" "$(list_audius "$query" || fail "Audius search failed")" "$ICON_MUSIC" queue
+  menu_list "Audius · $query" "$(list audius "$query" || fail "Audius search failed")" "$ICON_MUSIC" queue
 }
 
 menu_audius() {
@@ -451,7 +617,10 @@ menu() {
   choice=$(select_row "shojey" 360 <<<"$rows") || return 0
   case "$choice" in
     "Play / Pause") toggle ;;
-    "Stop") stop ;;
+    "Stop")
+      rm -f "$SLEEP"
+      stop
+      ;;
     "SomaFM") menu_soma ;;
     "Radio Paradise") menu_paradise ;;
     "Radio search") menu_radio ;;
@@ -470,7 +639,7 @@ Usage: shojey <command>
   soma | paradise | radio | audius | trending | search | ccmixter | favorites
                        jump straight to one source in the picker
   list soma | paradise | radio [query] | audius [query] | ccmixter [query]
-       | favorites | recent
+       | favorites | recent | history
                        print entries as JSON
   paradise-now <chan>  current Radio Paradise song and cover as JSON
   play <url> [title]   play a stream or file
@@ -478,7 +647,10 @@ Usage: shojey <command>
   play-list <i> <json> queue a \`list\` result and start at index i
   play-saved <url>     replay a recent or favorite entry
   fav [url] [title]    toggle a favorite (default: what's playing)
-  forget <url>         remove an entry from recent plays
+  forget <url>         remove an entry from recent plays or the song history
+  copy <text>          copy a song title to the clipboard
+  volume [N|+N|-N]     print or set the player volume, 0-100
+  sleep [minutes|off]  stop playback after a while; prints the timer
   resume               play the most recent entry again
   dismiss              clear the last playback error
   toggle               pause / resume (resumes the last entry when stopped)
@@ -519,8 +691,14 @@ case "${1:-menu}" in
   toggle) toggle ;;
   resume) resume ;;
   forget) forget "${2:-}" ;;
+  copy) copy_text "${2:-}" ;;
+  volume) volume "${2:-}" ;;
+  sleep) sleep_timer "${2:-}" ;;
   dismiss) rm -f "$ERROR" ;;
-  stop) stop ;;
+  stop)
+    rm -f "$SLEEP"
+    stop
+    ;;
   status) status ;;
   -h | --help | help) usage ;;
   *)

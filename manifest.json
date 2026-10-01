@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "boris.shojey",
   "name": "shojey",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Boris",
   "license": "MIT",
   "description": "A tiny music player: SomaFM, Radio Paradise, Radio Browser, Audius and ccMixter streamed through mpv, controlled from the bar and your media keys.",
