@@ -352,7 +352,9 @@ seek() {
     [+-]*)
       [[ $arg =~ ^[+-][0-9]+$ ]] || fail "seek needs M:SS, seconds, +N / -N seconds, or N%"
       position=$(ipc '{"command":["get_property","time-pos"]}' | jq -r '.data // 0 | floor')
-      target=$((position ${arg:0:1} 10#${arg:1}))
+      target=$((10#${arg:1}))
+      [[ $arg == -* ]] && target=$((-target))
+      target=$((position + target))
       ;;
     *%)
       [[ $arg =~ ^[0-9]+%$ ]] || fail "seek needs M:SS, seconds, +N / -N seconds, or N%"
