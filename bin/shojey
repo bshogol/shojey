@@ -338,6 +338,40 @@ volume() {
   echo "$level"
 }
 
+# seek <time> — jump within a track: M:SS or seconds from the start, +N / -N
+# seconds from here, or N% of the way through. A live stream has no timeline.
+seek() {
+  local arg="${1:-}" length position part target=0
+  running || fail "nothing playing to seek in"
+  length=$(ipc '{"command":["get_property","duration"]}' | jq -r '.data // 0 | floor')
+  if [[ $(jq -r '.live // false' "$CURRENT" 2>/dev/null) == true ]] || ((length <= 0)) \
+    || [[ $(ipc '{"command":["get_property","seekable"]}' | jq -r '.data // false') != true ]]; then
+    fail "can't seek in a live stream"
+  fi
+  case "$arg" in
+    [+-]*)
+      [[ $arg =~ ^[+-][0-9]+$ ]] || fail "seek needs M:SS, seconds, +N / -N seconds, or N%"
+      position=$(ipc '{"command":["get_property","time-pos"]}' | jq -r '.data // 0 | floor')
+      target=$((position ${arg:0:1} 10#${arg:1}))
+      ;;
+    *%)
+      [[ $arg =~ ^[0-9]+%$ ]] || fail "seek needs M:SS, seconds, +N / -N seconds, or N%"
+      target=$((length * 10#${arg%\%} / 100))
+      ;;
+    *)
+      [[ $arg =~ ^[0-9]+(:[0-9]{1,2}){0,2}$ ]] || fail "seek needs M:SS, seconds, +N / -N seconds, or N%"
+      for part in ${arg//:/ }; do
+        target=$((target * 60 + 10#$part))
+      done
+      ((target < length)) || fail "the track is only $((length / 60)):$(printf '%02d' $((length % 60))) long"
+      ;;
+  esac
+  # Stay inside the track: seeking past the end would skip to the next one.
+  ((target > length - 1)) && target=$((length - 1))
+  ((target < 0)) && target=0
+  ipc "{\"command\":[\"seek\",$target,\"absolute\"]}" >/dev/null
+}
+
 # sleep_timer [minutes|off] — stop playback after a while; prints the timer
 # as JSON. The waiter only acts while its token is the one on file, so
 # setting a new timer or cancelling retires the old waiter within seconds.
@@ -650,6 +684,7 @@ Usage: shojey <command>
   forget <url>         remove an entry from recent plays or the song history
   copy <text>          copy a song title to the clipboard
   volume [N|+N|-N]     print or set the player volume, 0-100
+  seek <time>          jump within a track: M:SS, seconds, +N / -N, or N%
   sleep [minutes|off]  stop playback after a while; prints the timer
   resume               play the most recent entry again
   dismiss              clear the last playback error
@@ -693,6 +728,7 @@ case "${1:-menu}" in
   forget) forget "${2:-}" ;;
   copy) copy_text "${2:-}" ;;
   volume) volume "${2:-}" ;;
+  seek) seek "${2:-}" ;;
   sleep) sleep_timer "${2:-}" ;;
   dismiss) rm -f "$ERROR" ;;
   stop)

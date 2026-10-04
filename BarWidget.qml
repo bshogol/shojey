@@ -15,7 +15,7 @@ import qs.Ui
 //   scroll        volume
 //
 // Keys in the card: space play/pause, ←/→ previous/next, ↑/↓ volume,
-// f favorite, t sleep timer, s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/
+// , / . back / forward 10 seconds, g go to a time, f favorite, t sleep timer, s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/
 // ccMixter, o songs heard on air, esc back or close.
 BarWidget {
   id: root
@@ -85,6 +85,13 @@ BarWidget {
 
   // mpv's own volume, not the system's.
   readonly property real volume: player && player.volumeSupported ? player.volume : 1
+
+  // A track has a timeline to move along; a live stream doesn't.
+  readonly property bool seekable: player !== null && !live && player.canSeek && player.length > 0
+  // Where a seek is headed, shown until MPRIS reports the new position.
+  property real seekTarget: -1
+  readonly property real position: seekTarget >= 0 ? seekTarget : (player ? player.position : 0)
+  property bool jumping: false          // typing a time to go to
 
   // Started but not on MPRIS yet: mpv is still connecting.
   readonly property bool connecting: player === null && current !== null
@@ -193,6 +200,40 @@ BarWidget {
     if (!player || !player.volumeSupported) return
     player.volume = Math.max(0, Math.min(1, v))
     volumeSave.restart()
+  }
+
+  function seekTo(seconds) {
+    if (!seekable) return
+    seekTarget = Math.max(0, Math.min(player.length - 1, Math.floor(seconds)))
+    shojey(["seek", String(seekTarget)])
+    seekSettle.restart()
+  }
+
+  function seekBy(seconds) {
+    if (!seekable) return
+    shojey(["seek", (seconds < 0 ? "-" : "+") + Math.abs(seconds)])
+    seekSettle.restart()
+  }
+
+  function openJump() {
+    if (!seekable) return
+    jumpField.text = ""
+    jumping = true
+    Qt.callLater(function() { jumpField.forceActiveFocus() })
+  }
+
+  function closeJump() {
+    jumping = false
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // "3" is minute 3, "3:20" is 3:20; the script says so if the track is shorter.
+  function jump(text) {
+    text = text.trim()
+    if (!/^\d+(:\d{1,2}){0,2}$/.test(text)) return
+    shojey(["seek", text.indexOf(":") === -1 ? text + ":00" : text])
+    seekSettle.restart()
+    closeJump()
   }
 
   // off → 15 → 30 → 60 minutes → off
@@ -308,11 +349,14 @@ BarWidget {
       reload()
     } else {
       view = "home"
+      jumping = false
       searchDebounce.stop()
     }
   }
+  onSeekableChanged: if (!seekable) jumping = false
   onPlayingUrlChanged: {
     liveCover = ""
+    seekTarget = -1
     reload()
   }
   onRawTitleChanged: fetchLiveCover()
@@ -458,6 +502,15 @@ BarWidget {
     onTriggered: if (root.player) root.shojey(["volume", String(Math.round(root.player.volume * 100))])
   }
 
+  Timer {
+    id: seekSettle
+    interval: 800
+    onTriggered: {
+      root.seekTarget = -1
+      if (root.player) root.player.positionChanged()
+    }
+  }
+
   // Keeps the sleep countdown on the card current.
   Timer {
     interval: 10000
@@ -509,7 +562,7 @@ BarWidget {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.view !== "home"
+      blocked: root.view !== "home" || root.jumping
 
       onCloseRequested: root.close()
       onActivateRequested: if (root.player) root.player.togglePlaying()
@@ -526,6 +579,9 @@ BarWidget {
         else if (text === "r") root.browse("radio")
         else if (text === "a") root.browse("audius")
         else if (text === "o") root.browse("history")
+        else if (text === ",") root.seekBy(-10)
+        else if (text === ".") root.seekBy(10)
+        else if (text === "g") root.openJump()
         else if (text === "f") root.toggleFavorite()
         else if (text === "t" && root.player) root.cycleSleep()
       }
@@ -713,6 +769,7 @@ BarWidget {
           spacing: Style.space(4)
 
           Rectangle {
+            visible: !root.seekable
             width: parent.width
             height: Style.space(3)
             color: Qt.darker(root.bar.foreground, 4)
@@ -726,21 +783,69 @@ BarWidget {
             }
           }
 
+          // Seeks on release, so dragging doesn't stutter through the track.
+          PanelSlider {
+            id: scrubber
+            visible: root.seekable
+            bar: root.bar
+            width: parent.width
+            fillColor: Color.accent
+            maximum: root.player ? Math.max(1, root.player.length) : 1
+            step: 10
+            value: root.position
+            onReleased: function(v) { root.seekTo(v) }
+          }
+
           Item {
             width: parent.width
-            height: liveLabel.implicitHeight
+            height: root.jumping ? jumpField.implicitHeight : liveLabel.implicitHeight
 
             Text {
               id: liveLabel
+              visible: !root.jumping
+              anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: root.live ? "● LIVE" : (root.player ? root.formatTime(root.player.position) : "")
-              color: root.live && root.playing ? Color.accent : Qt.darker(root.bar.foreground, 1.7)
+              text: root.live ? "● LIVE"
+                : root.player ? root.formatTime(scrubber.dragging ? scrubber.liveValue : root.position) : ""
+              color: (root.live && root.playing) || jumpMouse.containsMouse ? Color.accent : Qt.darker(root.bar.foreground, 1.7)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
+
+              MouseArea {
+                id: jumpMouse
+                enabled: root.seekable
+                anchors.fill: parent
+                anchors.margins: -Style.space(4)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openJump()
+              }
+            }
+
+            TextField {
+              id: jumpField
+              visible: root.jumping
+              width: Style.space(110)
+              placeholderText: "go to m:ss"
+              foreground: root.bar.foreground
+              font.family: root.bar.fontFamily
+
+              onActiveFocusChanged: if (!jumpField.activeFocus) root.jumping = false
+
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.closeJump()
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  root.jump(jumpField.text)
+                  event.accepted = true
+                }
+              }
             }
 
             Text {
               anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
               text: root.live ? (root.playing ? "" : "paused") : (root.player ? root.formatTime(root.player.length) : "")
               color: Qt.darker(root.bar.foreground, 1.7)
