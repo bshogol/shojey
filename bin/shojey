@@ -21,7 +21,7 @@
 set -euo pipefail
 
 APP_NAME="shojey"
-USER_AGENT="shojey/0.2"
+USER_AGENT="shojey/0.3"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/shojey"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shojey"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/shojey"

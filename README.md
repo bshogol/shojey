@@ -112,3 +112,17 @@ ln -sfn "$PWD" ~/.config/omarchy/plugins/boris.shojey
 omarchy-shell shell rescanPlugins
 omarchy plugin enable boris.shojey --section right
 ```
+
+## Uninstall
+
+```
+omarchy plugin remove boris.shojey
+```
+
+Stop playback first (middle-click the bar icon): mpv runs on its own and keeps
+playing after the plugin is gone. shojey writes nothing outside its own
+directories; to clear your favorites, history and cached lists as well:
+
+```
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/shojey" "${XDG_CACHE_HOME:-$HOME/.cache}/shojey"
+```
