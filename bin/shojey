@@ -162,7 +162,7 @@ launch() {
   echo "$session" >"$SESSION"
   (
     # shellcheck disable=SC2086 # SHOJEY_MPV_ARGS is a list of extra flags.
-    mpv --no-video --idle=no --no-terminal --volume="$(saved_volume)" ${SHOJEY_MPV_ARGS:-} \
+    mpv --no-video --idle=no --no-terminal --audio-client-name=shojey --volume="$(saved_volume)" ${SHOJEY_MPV_ARGS:-} \
       --input-ipc-server="$SOCKET" \
       --stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10 \
       --playlist-start="$start" "$@" \

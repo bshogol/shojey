@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.Mpris
+import Quickshell.Services.Pipewire
 import qs.Commons
 import qs.Ui
 
@@ -95,12 +96,20 @@ BarWidget {
   readonly property real position: seekTarget >= 0 ? seekTarget : (player ? player.position : 0)
   property bool jumping: false          // typing a time to go to
 
-  // The spectrum behind the seek bar comes from cava, which is optional:
-  // without it the card just shows the bar.
-  readonly property int spectrumBands: 24
-  property bool spectrumAvailable: false
-  property var spectrum: []             // 0-100 per band, low to high
-  readonly property bool spectrumWanted: spectrumAvailable && popupOpen && view === "home" && playing
+  // The waveform behind the seek bar is how loud shojey's own stream has been
+  // over the last second or two, newest on the right.
+  readonly property int waveBars: 48
+  property var wave: []                 // 0-1 per bar, oldest first
+  property var waveRecent: []           // raw levels of the last three seconds
+  readonly property bool waveWanted: popupOpen && view === "home" && playing
+  // bin/shojey names its mpv stream, which tells it from any other mpv.
+  readonly property var stream: {
+    var nodes = Pipewire.nodes.values
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].isStream && nodes[i].name === "shojey") return nodes[i]
+    }
+    return null
+  }
 
   // Started but not on MPRIS yet: mpv is still connecting.
   readonly property bool connecting: player === null && current !== null
@@ -361,19 +370,16 @@ BarWidget {
     if (popupOpen) {
       now = Date.now()
       reload()
-      if (!spectrumAvailable) spectrumCheck.running = true
     } else {
       view = "home"
       expanded = false
+      wave = []
+      waveRecent = []
       jumping = false
       searchDebounce.stop()
     }
   }
   onSeekableChanged: if (!seekable) jumping = false
-  onSpectrumWantedChanged: {
-    spectrumProc.running = spectrumWanted
-    if (!spectrumWanted) spectrum = []
-  }
   onPlayingUrlChanged: {
     liveCover = ""
     seekTarget = -1
@@ -501,25 +507,33 @@ BarWidget {
     }
   }
 
-  Process {
-    id: spectrumCheck
-    running: true
-    command: ["sh", "-c", "command -v cava"]
-    onExited: function(code) { root.spectrumAvailable = code === 0 }
+  PwObjectTracker {
+    objects: root.stream ? [root.stream] : []
   }
 
-  // cava listens to the system output, so it hears everything that plays,
-  // not only shojey; it runs just while the card shows something playing.
-  Process {
-    id: spectrumProc
-    running: false
-    command: ["sh", "-c", "exec cava -p /dev/stdin <<EOF\n"
-      + "[general]\nbars = " + root.spectrumBands + "\nframerate = 30\n"
-      + "[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\n"
-      + "ascii_max_range = 100\nchannels = mono\nEOF"]
+  PwNodePeakMonitor {
+    id: streamLevel
+    node: root.stream
+    enabled: root.waveWanted && root.stream !== null
+  }
 
-    stdout: SplitParser {
-      onRead: function(line) { root.spectrum = line.split(";") }
+  Timer {
+    interval: 33
+    repeat: true
+    running: streamLevel.enabled
+    onTriggered: {
+      var level = streamLevel.peak
+      // Music sits in a narrow band of loudness; stretch the band of the
+      // last few seconds over the bar height, so a quiet passage still moves.
+      var recent = root.waveRecent.slice(-89)
+      recent.push(level)
+      root.waveRecent = recent
+      var sorted = recent.slice().sort(function(a, b) { return a - b })
+      var low = sorted[Math.floor(sorted.length / 10)]
+      var range = Math.max(0.15, sorted[sorted.length - 1] - low)
+      var next = root.wave.slice(1 - root.waveBars)
+      next.push(Math.pow(Math.min(1, Math.max(0, (level - low) / range)), 0.7))
+      root.wave = next
     }
   }
 
@@ -811,43 +825,34 @@ BarWidget {
           width: parent.width
           spacing: Style.space(4)
 
-          // The seek bar runs through the middle of the spectrum, which is
-          // mirrored around the bass: lows in the center, highs at the edges.
+          // The seek bar runs through the middle of the waveform.
           Item {
             id: timeline
             width: parent.width
-            height: root.spectrumAvailable ? Style.space(44)
-              : root.seekable ? scrubber.implicitHeight : Style.space(3)
+            height: Style.space(44)
 
             Row {
-              id: spectrumRow
-              visible: root.spectrumAvailable
+              id: waveRow
               anchors.centerIn: parent
               height: parent.height
               spacing: Style.space(2)
 
-              readonly property int count: root.spectrumBands * 2
-              readonly property real barWidth: (timeline.width - spacing * (count - 1)) / count
+              readonly property real barWidth: (timeline.width - spacing * (root.waveBars - 1)) / root.waveBars
 
               Repeater {
-                model: spectrumRow.count
+                model: root.waveBars
 
                 Rectangle {
                   required property int index
-                  readonly property int band: index < root.spectrumBands ? root.spectrumBands - 1 - index : index - root.spectrumBands
                   // On a track, the part already played is lit.
-                  readonly property bool lit: !root.seekable || (index + 0.5) / spectrumRow.count <= scrubber.progress
+                  readonly property bool lit: !root.seekable || (index + 0.5) / root.waveBars <= scrubber.progress
 
                   anchors.verticalCenter: parent.verticalCenter
-                  width: spectrumRow.barWidth
-                  height: Math.max(width, (Number(root.spectrum[band]) || 0) / 100 * timeline.height)
+                  width: waveRow.barWidth
+                  height: Math.max(width, (root.wave[root.wave.length - root.waveBars + index] || 0) * timeline.height)
                   radius: width / 2
                   color: lit ? Color.accent : root.bar.foreground
                   opacity: lit ? 0.55 : 0.25
-
-                  Behavior on height {
-                    NumberAnimation { duration: 80 }
-                  }
                 }
               }
             }
