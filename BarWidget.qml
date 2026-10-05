@@ -15,8 +15,8 @@ import qs.Ui
 //   scroll        volume
 //
 // Keys in the card: space play/pause, ←/→ previous/next, ↑/↓ volume,
-// , / . back / forward 10 seconds, g go to a time, f favorite, t sleep timer, s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/
-// ccMixter, o songs heard on air, esc back or close.
+// , / . back / forward 10 seconds, g go to a time, f favorite, t sleep timer, b show / hide the sources,
+// s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/ccMixter, o songs heard on air, esc back or close.
 BarWidget {
   id: root
   moduleName: "boris.shojey"
@@ -42,6 +42,8 @@ BarWidget {
   readonly property string glyphVolume: String.fromCodePoint(0xf057e)
   readonly property string glyphVolumeLow: String.fromCodePoint(0xf057f)
   readonly property string glyphVolumeOff: String.fromCodePoint(0xf0581)
+  readonly property string glyphExpand: String.fromCodePoint(0xf0140)
+  readonly property string glyphCollapse: String.fromCodePoint(0xf0143)
 
   readonly property var sources: ({
     soma: { title: "SomaFM", placeholder: "Filter channels", local: true },
@@ -93,6 +95,13 @@ BarWidget {
   readonly property real position: seekTarget >= 0 ? seekTarget : (player ? player.position : 0)
   property bool jumping: false          // typing a time to go to
 
+  // The spectrum behind the seek bar comes from cava, which is optional:
+  // without it the card just shows the bar.
+  readonly property int spectrumBands: 24
+  property bool spectrumAvailable: false
+  property var spectrum: []             // 0-100 per band, low to high
+  readonly property bool spectrumWanted: spectrumAvailable && popupOpen && view === "home" && playing
+
   // Started but not on MPRIS yet: mpv is still connecting.
   readonly property bool connecting: player === null && current !== null
   readonly property var resumeEntry: recent.length > 0 ? recent[0] : null
@@ -120,6 +129,11 @@ BarWidget {
   readonly property string artUrl: liveCover || (entry && entry.art ? entry.art : "")
 
   property bool popupOpen: false
+
+  // While something plays the card is just the player; the sources and the
+  // saved lists wait behind "Browse". With nothing playing they are the card.
+  property bool expanded: false
+  readonly property bool browsable: expanded || (player === null && !connecting)
 
   // --- browse state ------------------------------------------------------
   property string view: "home"          // "home" | "browse"
@@ -347,13 +361,19 @@ BarWidget {
     if (popupOpen) {
       now = Date.now()
       reload()
+      if (!spectrumAvailable) spectrumCheck.running = true
     } else {
       view = "home"
+      expanded = false
       jumping = false
       searchDebounce.stop()
     }
   }
   onSeekableChanged: if (!seekable) jumping = false
+  onSpectrumWantedChanged: {
+    spectrumProc.running = spectrumWanted
+    if (!spectrumWanted) spectrum = []
+  }
   onPlayingUrlChanged: {
     liveCover = ""
     seekTarget = -1
@@ -481,6 +501,28 @@ BarWidget {
     }
   }
 
+  Process {
+    id: spectrumCheck
+    running: true
+    command: ["sh", "-c", "command -v cava"]
+    onExited: function(code) { root.spectrumAvailable = code === 0 }
+  }
+
+  // cava listens to the system output, so it hears everything that plays,
+  // not only shojey; it runs just while the card shows something playing.
+  Process {
+    id: spectrumProc
+    running: false
+    command: ["sh", "-c", "exec cava -p /dev/stdin <<EOF\n"
+      + "[general]\nbars = " + root.spectrumBands + "\nframerate = 30\n"
+      + "[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\n"
+      + "ascii_max_range = 100\nchannels = mono\nEOF"]
+
+    stdout: SplitParser {
+      onRead: function(line) { root.spectrum = line.split(";") }
+    }
+  }
+
   Timer {
     id: coverRetry
     interval: 5000
@@ -582,6 +624,7 @@ BarWidget {
         else if (text === ",") root.seekBy(-10)
         else if (text === ".") root.seekBy(10)
         else if (text === "g") root.openJump()
+        else if (text === "b") root.expanded = !root.expanded
         else if (text === "f") root.toggleFavorite()
         else if (text === "t" && root.player) root.cycleSleep()
       }
@@ -768,37 +811,81 @@ BarWidget {
           width: parent.width
           spacing: Style.space(4)
 
-          Rectangle {
-            visible: !root.seekable
+          // The seek bar runs through the middle of the spectrum, which is
+          // mirrored around the bass: lows in the center, highs at the edges.
+          Item {
+            id: timeline
             width: parent.width
-            height: Style.space(3)
-            color: Qt.darker(root.bar.foreground, 4)
+            height: root.spectrumAvailable ? Style.space(44)
+              : root.seekable ? scrubber.implicitHeight : Style.space(3)
+
+            Row {
+              id: spectrumRow
+              visible: root.spectrumAvailable
+              anchors.centerIn: parent
+              height: parent.height
+              spacing: Style.space(2)
+
+              readonly property int count: root.spectrumBands * 2
+              readonly property real barWidth: (timeline.width - spacing * (count - 1)) / count
+
+              Repeater {
+                model: spectrumRow.count
+
+                Rectangle {
+                  required property int index
+                  readonly property int band: index < root.spectrumBands ? root.spectrumBands - 1 - index : index - root.spectrumBands
+                  // On a track, the part already played is lit.
+                  readonly property bool lit: !root.seekable || (index + 0.5) / spectrumRow.count <= scrubber.progress
+
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: spectrumRow.barWidth
+                  height: Math.max(width, (Number(root.spectrum[band]) || 0) / 100 * timeline.height)
+                  radius: width / 2
+                  color: lit ? Color.accent : root.bar.foreground
+                  opacity: lit ? 0.55 : 0.25
+
+                  Behavior on height {
+                    NumberAnimation { duration: 80 }
+                  }
+                }
+              }
+            }
 
             Rectangle {
-              height: parent.height
-              color: Color.accent
-              opacity: root.playing ? 1 : 0.5
-              width: root.live ? parent.width
-                : root.player && root.player.length > 0 ? parent.width * Math.min(1, root.player.position / root.player.length) : 0
-            }
-          }
+              visible: !root.seekable
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              height: Style.space(3)
+              color: Qt.darker(root.bar.foreground, 4)
 
-          // Seeks on release, so dragging doesn't stutter through the track.
-          PanelSlider {
-            id: scrubber
-            visible: root.seekable
-            bar: root.bar
-            width: parent.width
-            fillColor: Color.accent
-            maximum: root.player ? Math.max(1, root.player.length) : 1
-            step: 10
-            value: root.position
-            onReleased: function(v) { root.seekTo(v) }
+              Rectangle {
+                height: parent.height
+                color: Color.accent
+                opacity: root.playing ? 1 : 0.5
+                width: root.live ? parent.width
+                  : root.player && root.player.length > 0 ? parent.width * Math.min(1, root.player.position / root.player.length) : 0
+              }
+            }
+
+            // Seeks on release, so dragging doesn't stutter through the track.
+            PanelSlider {
+              id: scrubber
+              visible: root.seekable
+              anchors.verticalCenter: parent.verticalCenter
+              bar: root.bar
+              width: parent.width
+              fillColor: Color.accent
+              maximum: root.player ? Math.max(1, root.player.length) : 1
+              step: 10
+              value: root.position
+              onReleased: function(v) { root.seekTo(v) }
+            }
           }
 
           Item {
             width: parent.width
-            height: root.jumping ? jumpField.implicitHeight : liveLabel.implicitHeight
+            height: root.jumping ? jumpField.implicitHeight : Math.max(liveLabel.implicitHeight, volumeRow.height)
 
             Text {
               id: liveLabel
@@ -843,6 +930,45 @@ BarWidget {
               }
             }
 
+            // The volume sits between the two times.
+            Row {
+              id: volumeRow
+              visible: !root.jumping && root.player !== null && root.player.volumeSupported
+              anchors.centerIn: parent
+              height: Style.space(16)
+              spacing: Style.space(6)
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.volume <= 0 ? root.glyphVolumeOff : root.volume < 0.5 ? root.glyphVolumeLow : root.glyphVolume
+                color: Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              PanelSlider {
+                bar: root.bar
+                width: Style.space(110)
+                height: parent.height
+                anchors.verticalCenter: parent.verticalCenter
+                trackHeight: Style.space(2)
+                knobSize: Style.space(10)
+                fillColor: Color.accent
+                value: root.volume
+                onMoved: function(v) { root.setVolume(v) }
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: Math.round(root.volume * 100)
+                color: Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
             Text {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
@@ -853,34 +979,20 @@ BarWidget {
               font.pixelSize: Style.font.caption
             }
           }
+        }
 
-          Row {
-            visible: root.player !== null && root.player.volumeSupported
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              id: volumeGlyph
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.volume <= 0 ? root.glyphVolumeOff : root.volume < 0.5 ? root.glyphVolumeLow : root.glyphVolume
-              color: Qt.darker(root.bar.foreground, 1.3)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-            }
-
-            PanelSlider {
-              bar: root.bar
-              width: parent.width - volumeGlyph.width - parent.spacing
-              anchors.verticalCenter: parent.verticalCenter
-              value: root.volume
-              onMoved: function(v) { root.setVolume(v) }
-            }
-          }
+        Button {
+          visible: root.player !== null || root.connecting
+          anchors.horizontalCenter: parent.horizontalCenter
+          iconText: root.expanded ? root.glyphCollapse : root.glyphExpand
+          text: root.expanded ? "Less" : "Browse"
+          foreground: Qt.darker(root.bar.foreground, 1.3)
+          onClicked: root.expanded = !root.expanded
         }
 
         // Stations on top, on-demand tracks below.
         Column {
+          visible: root.browsable
           width: parent.width
           spacing: Style.space(6)
 
@@ -934,7 +1046,7 @@ BarWidget {
           Column {
             id: savedSection
             required property var modelData
-            visible: modelData.items.length > 0
+            visible: root.browsable && modelData.items.length > 0
             width: homeColumn.width
             spacing: Style.space(2)
 
