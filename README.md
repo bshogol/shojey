@@ -51,6 +51,11 @@ The volume is mpv's own, separate from the system volume, and is kept for the
 next play. The sleep timer button steps through 15, 30 and 60 minutes and off;
 playback stops when it runs out.
 
+With `cava` installed, a mirrored spectrum of what is playing moves behind the
+seek bar: bass in the middle, highs at the edges, and on a track the part
+already played is lit. cava listens to the system output, so other audio shows
+up in it too. Without cava the card just shows the bar.
+
 A track (anything that isn't a live station) gets a seek bar: drag it, click
 anywhere on it, or scroll over it to move through the track. Click the elapsed
 time, or press g, to type where to go: `3` jumps to minute 3, `3:20` to 3:20.
@@ -98,6 +103,8 @@ sleep timer) and `$XDG_STATE_HOME/shojey/` (`recent.json`, `favorites.json`,
 
 `mpv`, `mpv-mpris`, `socat`, `jq`, `curl`, `wl-clipboard` — plus Omarchy's
 `omarchy-menu-select` and `omarchy-menu-input`.
+
+Optional: `cava`, for the spectrum behind the seek bar.
 
 ## Install
 
