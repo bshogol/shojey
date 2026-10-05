@@ -7,9 +7,10 @@ the system `mpv-mpris` script exposes mpv over MPRIS, Omarchy's media keys, OSD
 and media widget control it like any other player.
 
 <p>
-  <img src="screenshots/card.png" width="270" alt="The now-playing card under the bar: artwork, controls, sources and recent plays">
-  <img src="screenshots/somafm.png" width="270" alt="Browsing SomaFM channels inside the card">
-  <img src="screenshots/audius.png" width="270" alt="Trending Audius tracks inside the card">
+  <img src="screenshots/card.png" width="210" alt="The now-playing card under the bar: artwork, controls, a spectrum with the seek bar through it, and the volume between the times">
+  <img src="screenshots/browse.png" width="210" alt="The card with Browse unfolded: source buttons, recent plays and songs heard on air">
+  <img src="screenshots/somafm.png" width="210" alt="Browsing SomaFM channels inside the card">
+  <img src="screenshots/audius.png" width="210" alt="Trending Audius tracks inside the card">
 </p>
 
 ## Sources
@@ -36,8 +37,11 @@ instant, and the last copy is shown if a refresh fails.
 | scroll | volume |
 
 The card shows artwork, track and source, prev / play / next / favorite, a
-sleep timer, a LIVE marker or track position, a volume slider, buttons for
-each source, and your favorites and recent plays. Everything happens in the card: pick a source and its channels or
+sleep timer, a LIVE marker or track position, and the volume between the two
+times. While
+something plays that is all of it; "Browse" (or b) unfolds buttons for each
+source and your favorites and recent plays, and they are shown straight away
+when nothing is playing. Everything happens in the card: pick a source and its channels or
 search results open in place. "All ›" opens the full favorites or recent list,
 where ✕ (or Delete) removes an entry.
 
@@ -65,7 +69,7 @@ look up what was playing earlier. Picking a song copies its title to the
 clipboard.
 
 Keys: space play/pause, ←/→ previous/next, ↑/↓ volume, , / . back / forward 10 seconds,
-g go to a time, f favorite, t sleep timer, s/p/r/a/c open SomaFM/Paradise/Radio/Audius/ccMixter, o songs heard on
+g go to a time, f favorite, t sleep timer, b show / hide the sources, s/p/r/a/c open SomaFM/Paradise/Radio/Audius/ccMixter, o songs heard on
 air, ↑/↓ and enter in a list, esc back.
 
 Bind the card to a key with:
