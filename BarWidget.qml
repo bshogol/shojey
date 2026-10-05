@@ -15,8 +15,8 @@ import qs.Ui
 //   scroll        volume
 //
 // Keys in the card: space play/pause, ←/→ previous/next, ↑/↓ volume,
-// , / . back / forward 10 seconds, g go to a time, f favorite, t sleep timer, s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/
-// ccMixter, o songs heard on air, esc back or close.
+// , / . back / forward 10 seconds, g go to a time, f favorite, t sleep timer, b show / hide the sources,
+// s/p/r/a/c browse SomaFM/Paradise/Radio/Audius/ccMixter, o songs heard on air, esc back or close.
 BarWidget {
   id: root
   moduleName: "boris.shojey"
@@ -42,6 +42,8 @@ BarWidget {
   readonly property string glyphVolume: String.fromCodePoint(0xf057e)
   readonly property string glyphVolumeLow: String.fromCodePoint(0xf057f)
   readonly property string glyphVolumeOff: String.fromCodePoint(0xf0581)
+  readonly property string glyphExpand: String.fromCodePoint(0xf0140)
+  readonly property string glyphCollapse: String.fromCodePoint(0xf0143)
 
   readonly property var sources: ({
     soma: { title: "SomaFM", placeholder: "Filter channels", local: true },
@@ -127,6 +129,11 @@ BarWidget {
   readonly property string artUrl: liveCover || (entry && entry.art ? entry.art : "")
 
   property bool popupOpen: false
+
+  // While something plays the card is just the player; the sources and the
+  // saved lists wait behind "Browse". With nothing playing they are the card.
+  property bool expanded: false
+  readonly property bool browsable: expanded || (player === null && !connecting)
 
   // --- browse state ------------------------------------------------------
   property string view: "home"          // "home" | "browse"
@@ -357,6 +364,7 @@ BarWidget {
       if (!spectrumAvailable) spectrumCheck.running = true
     } else {
       view = "home"
+      expanded = false
       jumping = false
       searchDebounce.stop()
     }
@@ -616,6 +624,7 @@ BarWidget {
         else if (text === ",") root.seekBy(-10)
         else if (text === ".") root.seekBy(10)
         else if (text === "g") root.openJump()
+        else if (text === "b") root.expanded = !root.expanded
         else if (text === "f") root.toggleFavorite()
         else if (text === "t" && root.player) root.cycleSleep()
       }
@@ -876,7 +885,7 @@ BarWidget {
 
           Item {
             width: parent.width
-            height: root.jumping ? jumpField.implicitHeight : liveLabel.implicitHeight
+            height: root.jumping ? jumpField.implicitHeight : Math.max(liveLabel.implicitHeight, volumeRow.height)
 
             Text {
               id: liveLabel
@@ -921,6 +930,45 @@ BarWidget {
               }
             }
 
+            // The volume sits between the two times.
+            Row {
+              id: volumeRow
+              visible: !root.jumping && root.player !== null && root.player.volumeSupported
+              anchors.centerIn: parent
+              height: Style.space(16)
+              spacing: Style.space(6)
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.volume <= 0 ? root.glyphVolumeOff : root.volume < 0.5 ? root.glyphVolumeLow : root.glyphVolume
+                color: Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              PanelSlider {
+                bar: root.bar
+                width: Style.space(110)
+                height: parent.height
+                anchors.verticalCenter: parent.verticalCenter
+                trackHeight: Style.space(2)
+                knobSize: Style.space(10)
+                fillColor: Color.accent
+                value: root.volume
+                onMoved: function(v) { root.setVolume(v) }
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: Math.round(root.volume * 100)
+                color: Qt.darker(root.bar.foreground, 1.7)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
             Text {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
@@ -931,34 +979,20 @@ BarWidget {
               font.pixelSize: Style.font.caption
             }
           }
+        }
 
-          Row {
-            visible: root.player !== null && root.player.volumeSupported
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              id: volumeGlyph
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.volume <= 0 ? root.glyphVolumeOff : root.volume < 0.5 ? root.glyphVolumeLow : root.glyphVolume
-              color: Qt.darker(root.bar.foreground, 1.3)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-            }
-
-            PanelSlider {
-              bar: root.bar
-              width: parent.width - volumeGlyph.width - parent.spacing
-              anchors.verticalCenter: parent.verticalCenter
-              value: root.volume
-              onMoved: function(v) { root.setVolume(v) }
-            }
-          }
+        Button {
+          visible: root.player !== null || root.connecting
+          anchors.horizontalCenter: parent.horizontalCenter
+          iconText: root.expanded ? root.glyphCollapse : root.glyphExpand
+          text: root.expanded ? "Less" : "Browse"
+          foreground: Qt.darker(root.bar.foreground, 1.3)
+          onClicked: root.expanded = !root.expanded
         }
 
         // Stations on top, on-demand tracks below.
         Column {
+          visible: root.browsable
           width: parent.width
           spacing: Style.space(6)
 
@@ -1012,7 +1046,7 @@ BarWidget {
           Column {
             id: savedSection
             required property var modelData
-            visible: modelData.items.length > 0
+            visible: root.browsable && modelData.items.length > 0
             width: homeColumn.width
             spacing: Style.space(2)
 
