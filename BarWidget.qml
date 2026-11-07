@@ -58,8 +58,9 @@ BarWidget {
     history: { title: "Heard on air", placeholder: "Filter songs", local: true, saved: true, copy: true }
   })
 
-  // mpv-mpris registers every mpv as identity "mpv", so only count the one
-  // playing a url shojey started; a video in another mpv is left alone.
+  // mpv-mpris sets Identity from audio-client-name. shojey names its mpv
+  // "shojey", so another mpv (identity "mpv") is left alone. The url check
+  // still ignores a player that isn't one shojey started.
   readonly property var player: {
     var known = ({})
     if (current) known[current.url] = true
@@ -67,7 +68,7 @@ BarWidget {
     var list = Mpris.players ? Mpris.players.values : []
     for (var i = 0; i < list.length; i++) {
       var p = list[i]
-      if (!p || String(p.identity || "").toLowerCase() !== "mpv") continue
+      if (!p || String(p.identity || "").toLowerCase() !== "shojey") continue
       var url = p.metadata ? p.metadata["xesam:url"] : undefined
       if (url !== undefined && known[String(url)]) return p
     }
